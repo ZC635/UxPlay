@@ -279,6 +279,8 @@ dnssd_destroy(dnssd_t *dnssd)
 #elif USE_LIBDL
         dlclose(dnssd->module);
 #endif
+        free(dnssd->name);
+        free(dnssd->hw_addr);
         free(dnssd);
     }
 }
@@ -454,7 +456,9 @@ dnssd_unregister_raop(dnssd_t *dnssd)
 
     if (dnssd->airplay_service == NULL) {
         free(dnssd->name);
+        dnssd->name = NULL;
         free(dnssd->hw_addr);
+        dnssd->hw_addr = NULL;
     }
 }
 
@@ -475,7 +479,9 @@ dnssd_unregister_airplay(dnssd_t *dnssd)
 
     if (dnssd->raop_service == NULL) {
         free(dnssd->name);
+        dnssd->name = NULL;
         free(dnssd->hw_addr);
+        dnssd->hw_addr = NULL;
     }
 }
 
