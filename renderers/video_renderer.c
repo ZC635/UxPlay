@@ -22,6 +22,7 @@
 
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include <gst/video/videooverlay.h>
 #include "video_renderer.h"
 
 #define SECOND_IN_NSECS 1000000000UL
@@ -57,6 +58,9 @@ static int type_264 = 0;
 static int type_265 = 0;
 static int type_hls = 0;
 static int type_jpeg = 0;
+static guintptr g_window_handle = 0;
+
+static void apply_stored_window_handle(void);
 
 typedef enum {
   //GST_PLAY_FLAG_VIDEO         = (1 << 0),
@@ -489,6 +493,7 @@ void video_renderer_start() {
 	gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
 	state_name = gst_element_state_get_name(state);
 	logger_log(logger, LOGGER_DEBUG, "video renderer_start: state %s", state_name);
+        apply_stored_window_handle();
         return;
     } 
     /* when not hls, start both h264 and h265 pipelines; will shut down the "wrong" one when we know the codec */
@@ -1047,6 +1052,7 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
     logger_log(logger, LOGGER_DEBUG, "video_pipeline state change from %s to %s\n",
                gst_element_state_get_name (old_state),gst_element_state_get_name (new_state));
     gst_video_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+    apply_stored_window_handle();
     if (strstr(renderer->codec, h265)) {
         logger_log(logger, LOGGER_INFO, "*** video format is h265 high definition (HD/4K) video %dx%d", width, height);
     }
@@ -1152,4 +1158,43 @@ bool video_renderer_eos_watch() {
 	return true;
     }
     return false; 
+}
+
+static GstElement *find_video_overlay_element(GstElement *pipeline) {
+    if (GST_IS_BIN(pipeline)) {
+        GstIterator *it = gst_bin_iterate_elements(GST_BIN(pipeline));
+        GstElement *result = NULL;
+        GValue item = G_VALUE_INIT;
+        while (gst_iterator_next(it, &item) == GST_ITERATOR_OK) {
+            GstElement *child = GST_ELEMENT(g_value_get_object(&item));
+            if (GST_IS_VIDEO_OVERLAY(child)) {
+                result = child;
+                g_value_reset(&item);
+                break;
+            }
+            result = find_video_overlay_element(child);
+            if (result) {
+                g_value_reset(&item);
+                break;
+            }
+            g_value_reset(&item);
+        }
+        gst_iterator_free(it);
+        return result;
+    }
+    return NULL;
+}
+
+static void apply_stored_window_handle(void) {
+    if (!g_window_handle || !renderer || !renderer->pipeline) return;
+    GstElement *sink = find_video_overlay_element(renderer->pipeline);
+    if (sink) {
+        gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(sink), g_window_handle);
+        g_object_set(G_OBJECT(sink), "force-aspect-ratio", FALSE, NULL);
+    }
+}
+
+void video_renderer_set_window_handle(void *handle) {
+    g_window_handle = (guintptr)handle;
+    apply_stored_window_handle();
 }
