@@ -1037,12 +1037,12 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
     }
     if (renderer_used == NULL) {
         return -1;
-    } else if (renderer_used == renderer) {
-        return 0;
-    } else if (renderer) {
-        return -1;
+    } else if (renderer_used != renderer) {
+        if (renderer) {
+            return -1;
+        }
+        renderer = renderer_used;
     }
-    renderer = renderer_used;
     gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
     GstState old_state, new_state;
     if (gst_element_get_state(renderer->pipeline, &old_state, &new_state, 100 * GST_MSECOND) == GST_STATE_CHANGE_FAILURE) {
