@@ -663,6 +663,15 @@ void video_renderer_stop() {
             gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
         }
         gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
+        GstState state = GST_STATE_VOID_PENDING;
+        GstState pending_state = GST_STATE_VOID_PENDING;
+        GstStateChangeReturn ret = gst_element_get_state(renderer->pipeline, &state, &pending_state, 250 * GST_MSECOND);
+        if (ret == GST_STATE_CHANGE_FAILURE) {
+            logger_log(logger, LOGGER_ERR, "video_renderer_stop: state change to NULL failed");
+        } else if (ret == GST_STATE_CHANGE_ASYNC) {
+            logger_log(logger, LOGGER_WARNING, "video_renderer_stop: state change to NULL still pending");
+        }
+        logger_log(logger, LOGGER_DEBUG, "video_renderer_stop: state %s", gst_element_state_get_name(state));
         //gst_element_set_state (renderer->playbin, GST_STATE_NULL);
      }
 }
