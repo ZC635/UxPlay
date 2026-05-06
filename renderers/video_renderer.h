@@ -75,6 +75,8 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265);
 unsigned int video_renderer_listen(void *loop, int id);
 bool video_renderer_eos_watch();
 void video_renderer_set_window_handle(void *handle);
+void video_renderer_set_force_aspect_ratio(bool enabled);
+bool video_renderer_get_force_aspect_ratio(void);
 #ifdef __cplusplus
 }
 #endif

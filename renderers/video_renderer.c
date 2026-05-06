@@ -59,6 +59,7 @@ static int type_265 = 0;
 static int type_hls = 0;
 static int type_jpeg = 0;
 static guintptr g_window_handle = 0;
+static bool g_force_aspect_ratio = false;
 
 static void apply_stored_window_handle(void);
 
@@ -1208,11 +1209,20 @@ static void apply_stored_window_handle(void) {
     GstElement *sink = find_video_overlay_element(renderer->pipeline);
     if (sink) {
         gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(sink), g_window_handle);
-        g_object_set(G_OBJECT(sink), "force-aspect-ratio", FALSE, NULL);
+        g_object_set(G_OBJECT(sink), "force-aspect-ratio", g_force_aspect_ratio ? TRUE : FALSE, NULL);
     }
 }
 
 void video_renderer_set_window_handle(void *handle) {
     g_window_handle = (guintptr)handle;
     apply_stored_window_handle();
+}
+
+void video_renderer_set_force_aspect_ratio(bool enabled) {
+    g_force_aspect_ratio = enabled;
+    apply_stored_window_handle();
+}
+
+bool video_renderer_get_force_aspect_ratio(void) {
+    return g_force_aspect_ratio;
 }
