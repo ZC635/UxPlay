@@ -125,7 +125,7 @@ bool gstreamer_init(){
     return (bool) check_plugins ();
 }
 
-void audio_renderer_init(logger_t *render_logger, const char* audiosink, const bool* audio_sync, const bool* video_sync, const char *artp_pipeline) {
+int audio_renderer_init(logger_t *render_logger, const char* audiosink, const bool* audio_sync, const bool* video_sync, const char *artp_pipeline) {
     GError *error = NULL;
     GstCaps *caps = NULL;
     GstClock *clock = gst_system_clock_obtain();
@@ -195,16 +195,20 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
             g_string_append (launch, artp_pipeline);
         }
         renderer_type[i]->pipeline  = gst_parse_launch(launch->str, &error);
-	if (error) {
-          g_error ("gst_parse_launch error (audio %d):\n %s\n", i+1, error->message);
-          g_clear_error (&error);
+        if (error) {
+            logger_log(logger, LOGGER_ERR, "gst_parse_launch error (audio %d):\n %s\n", i+1, error->message);
+            g_clear_error (&error);
         }
-
-        g_assert (renderer_type[i]->pipeline);
+        if (!renderer_type[i]->pipeline) {
+            return -1;
+        }
         gst_pipeline_use_clock(GST_PIPELINE_CAST(renderer_type[i]->pipeline), clock);
         renderer_type[i]->bus = gst_element_get_bus(renderer_type[i]->pipeline);
         renderer_type[i]->appsrc = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "audio_source");
         renderer_type[i]->volume = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "volume");
+        if (!renderer_type[i]->volume) {
+            return -1;
+        }
         switch (i) {
         case 0:
             caps =  gst_caps_from_string(aac_eld_caps);
@@ -236,6 +240,7 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         gst_caps_unref(caps);
         g_object_unref(clock);
     }
+    return 0;
 }
 
 void audio_renderer_stop() {
@@ -372,6 +377,9 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
 }
 
 void audio_renderer_set_volume(double volume) {
+    if (!renderer || !renderer->volume) {
+        return;
+    }
     volume = (volume > 10.0) ? 10.0 : volume;
     volume = (volume < 0.0) ? 0.0 : volume;
     g_object_set(renderer->volume, "volume", volume, NULL);
