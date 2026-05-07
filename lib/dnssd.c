@@ -33,7 +33,9 @@
 #endif
 
 #include "compat.h"
+#if !defined(_WIN32)
 #include <dns_sd.h>
+#endif
 #include "dnssd.h"
 
 #include "dnssdint.h"
@@ -63,7 +65,9 @@
 # endif
 
 typedef struct _DNSServiceRef_t *DNSServiceRef;
-#ifndef _WIN32
+#ifdef _WIN32
+typedef struct { uint8_t *buffer; uint16_t length; size_t capacity; } TXTRecordRef;
+#else
 typedef union _TXTRecordRef_t { char PrivateData[16]; char *ForceNaturalAlignment; } TXTRecordRef;
 #endif
 typedef uint32_t DNSServiceFlags;
@@ -118,6 +122,118 @@ typedef DNSServiceErrorType (DNSSD_STDCALL *TXTRecordSetValue_t)
 typedef uint16_t (DNSSD_STDCALL *TXTRecordGetLength_t)(const TXTRecordRef *txtRecord);
 typedef const void * (DNSSD_STDCALL *TXTRecordGetBytesPtr_t)(const TXTRecordRef *txtRecord);
 
+#ifdef WIN32
+static void DNSSD_STDCALL dnssd_win_txt_record_create(TXTRecordRef *txtRecord, uint16_t bufferLen, void *buffer) {
+    (void)bufferLen;
+    (void)buffer;
+    memset(txtRecord, 0, sizeof(*txtRecord));
+}
+
+static void DNSSD_STDCALL dnssd_win_txt_record_deallocate(TXTRecordRef *txtRecord) {
+    if (txtRecord) {
+        free(txtRecord->buffer);
+        memset(txtRecord, 0, sizeof(*txtRecord));
+    }
+}
+
+static DNSServiceErrorType DNSSD_STDCALL dnssd_win_txt_record_set_value(
+        TXTRecordRef *txtRecord, const char *key, uint8_t valueSize, const void *value) {
+    if (!txtRecord || !key) return -1;
+
+    size_t key_len = strlen(key);
+    if (key_len + 1 + valueSize > 255) return -1;
+
+    size_t entry_size = 1 + key_len + 1 + valueSize;
+    uint8_t *entry = (uint8_t *)malloc(entry_size);
+    if (!entry) return -1;
+
+    entry[0] = (uint8_t)(key_len + 1 + valueSize);
+    memcpy(entry + 1, key, key_len);
+    entry[1 + key_len] = '=';
+    if (valueSize > 0 && value) {
+        memcpy(entry + 1 + key_len + 1, value, valueSize);
+    }
+
+    uint8_t *read = txtRecord->buffer;
+    uint8_t *write = txtRecord->buffer;
+    uint8_t *end = txtRecord->buffer + txtRecord->length;
+    while (read < end) {
+        uint8_t entry_len = *read;
+        if (entry_len == 0 || read + 1 + entry_len > end) break;
+
+        int is_same_key = 0;
+        const uint8_t *equals = (const uint8_t *)memchr(read + 1, '=', entry_len);
+        if (equals) {
+            size_t existing_key_len = (size_t)(equals - (read + 1));
+            if (existing_key_len == key_len && memcmp(read + 1, key, key_len) == 0) {
+                is_same_key = 1;
+            }
+        }
+
+        if (!is_same_key) {
+            if (write != read) {
+                memmove(write, read, 1 + entry_len);
+            }
+            write += 1 + entry_len;
+        }
+        read += 1 + entry_len;
+    }
+    txtRecord->length = (uint16_t)(write - txtRecord->buffer);
+
+    size_t new_len = txtRecord->length + entry_size;
+    if (new_len > UINT16_MAX) {
+        free(entry);
+        return -1;
+    }
+    if (new_len > txtRecord->capacity) {
+        size_t new_cap = txtRecord->capacity ? txtRecord->capacity * 2 : 256;
+        while (new_cap < new_len) new_cap *= 2;
+        uint8_t *new_buf = (uint8_t *)realloc(txtRecord->buffer, new_cap);
+        if (!new_buf) {
+            free(entry);
+            return -1;
+        }
+        txtRecord->buffer = new_buf;
+        txtRecord->capacity = new_cap;
+    }
+
+    memcpy(txtRecord->buffer + txtRecord->length, entry, entry_size);
+    txtRecord->length = (uint16_t)new_len;
+    free(entry);
+    return 0;
+}
+
+static uint16_t DNSSD_STDCALL dnssd_win_txt_record_get_length(const TXTRecordRef *txtRecord) {
+    return txtRecord ? txtRecord->length : 0;
+}
+
+static const void * DNSSD_STDCALL dnssd_win_txt_record_get_bytes_ptr(const TXTRecordRef *txtRecord) {
+    return txtRecord ? txtRecord->buffer : NULL;
+}
+
+static DNSServiceErrorType DNSSD_STDCALL dnssd_win_service_register(
+        DNSServiceRef *sdRef,
+        DNSServiceFlags flags,
+        uint32_t interfaceIndex,
+        const char *name,
+        const char *regtype,
+        const char *domain,
+        const char *host,
+        uint16_t port,
+        uint16_t txtLen,
+        const void *txtRecord,
+        DNSServiceRegisterReply callBack,
+        void *context) {
+    (void)flags; (void)interfaceIndex; (void)name; (void)regtype; (void)domain;
+    (void)host; (void)port; (void)txtLen; (void)txtRecord; (void)callBack; (void)context;
+    if (sdRef) *sdRef = (DNSServiceRef)1;
+    return 0;
+}
+
+static void DNSSD_STDCALL dnssd_win_service_ref_deallocate(DNSServiceRef sdRef) {
+    (void)sdRef;
+}
+#endif
 
 struct dnssd_s {
 #ifdef WIN32
@@ -192,28 +308,13 @@ dnssd_init(const char* name, int name_len, const char* hw_addr, int hw_addr_len,
     dnssd->features2 = (uint32_t) features;
 
 #ifdef WIN32
-    dnssd->module = LoadLibraryA("dnssd.dll");
-	if (!dnssd->module) {
-		if (error) *error = DNSSD_ERROR_LIBNOTFOUND;
-		free(dnssd);
-		return NULL;
-	}
-	dnssd->DNSServiceRegister = (DNSServiceRegister_t)GetProcAddress(dnssd->module, "DNSServiceRegister");
-	dnssd->DNSServiceRefDeallocate = (DNSServiceRefDeallocate_t)GetProcAddress(dnssd->module, "DNSServiceRefDeallocate");
-	dnssd->TXTRecordCreate = (TXTRecordCreate_t)GetProcAddress(dnssd->module, "TXTRecordCreate");
-	dnssd->TXTRecordSetValue = (TXTRecordSetValue_t)GetProcAddress(dnssd->module, "TXTRecordSetValue");
-	dnssd->TXTRecordGetLength = (TXTRecordGetLength_t)GetProcAddress(dnssd->module, "TXTRecordGetLength");
-	dnssd->TXTRecordGetBytesPtr = (TXTRecordGetBytesPtr_t)GetProcAddress(dnssd->module, "TXTRecordGetBytesPtr");
-	dnssd->TXTRecordDeallocate = (TXTRecordDeallocate_t)GetProcAddress(dnssd->module, "TXTRecordDeallocate");
-
-	if (!dnssd->DNSServiceRegister || !dnssd->DNSServiceRefDeallocate || !dnssd->TXTRecordCreate ||
-	    !dnssd->TXTRecordSetValue || !dnssd->TXTRecordGetLength || !dnssd->TXTRecordGetBytesPtr ||
-	    !dnssd->TXTRecordDeallocate) {
-		if (error) *error = DNSSD_ERROR_PROCNOTFOUND;
-		FreeLibrary(dnssd->module);
-		free(dnssd);
-		return NULL;
-	}
+    dnssd->DNSServiceRegister = (DNSServiceRegister_t)dnssd_win_service_register;
+    dnssd->DNSServiceRefDeallocate = (DNSServiceRefDeallocate_t)dnssd_win_service_ref_deallocate;
+    dnssd->TXTRecordCreate = (TXTRecordCreate_t)dnssd_win_txt_record_create;
+    dnssd->TXTRecordSetValue = (TXTRecordSetValue_t)dnssd_win_txt_record_set_value;
+    dnssd->TXTRecordGetLength = (TXTRecordGetLength_t)dnssd_win_txt_record_get_length;
+    dnssd->TXTRecordGetBytesPtr = (TXTRecordGetBytesPtr_t)dnssd_win_txt_record_get_bytes_ptr;
+    dnssd->TXTRecordDeallocate = (TXTRecordDeallocate_t)dnssd_win_txt_record_deallocate;
 #elif USE_LIBDL
     dnssd->module = dlopen("libdns_sd.so", RTLD_LAZY);
 	if (!dnssd->module) {
@@ -274,9 +375,15 @@ void
 dnssd_destroy(dnssd_t *dnssd)
 {
     if (dnssd) {
-#ifdef WIN32
-        FreeLibrary(dnssd->module);
-#elif USE_LIBDL
+        if (dnssd->raop_service) {
+            dnssd->TXTRecordDeallocate(&dnssd->raop_record);
+            dnssd->DNSServiceRefDeallocate(dnssd->raop_service);
+        }
+        if (dnssd->airplay_service) {
+            dnssd->TXTRecordDeallocate(&dnssd->airplay_record);
+            dnssd->DNSServiceRefDeallocate(dnssd->airplay_service);
+        }
+#if USE_LIBDL
         dlclose(dnssd->module);
 #endif
         free(dnssd->name);
@@ -512,4 +619,14 @@ void dnssd_set_airplay_features(dnssd_t *dnssd, int bit, int val) {
     } else {
         *features = *features & ~mask;
     }
+}
+
+int
+dnssd_uses_external_runtime(void)
+{
+#ifdef _WIN32
+    return 0;
+#else
+    return 1;
+#endif
 }

@@ -51,6 +51,8 @@ DNSSD_API void dnssd_set_pk(dnssd_t *dnssd, char * pk_str);
 
 DNSSD_API void dnssd_destroy(dnssd_t *dnssd);
 
+DNSSD_API int dnssd_uses_external_runtime(void);
+
 #ifdef __cplusplus
 }
 #endif
