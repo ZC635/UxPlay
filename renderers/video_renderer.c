@@ -353,23 +353,32 @@ int video_renderer_init(logger_t *render_logger, const char *server_name, videof
                 g_string_append(launch, " ! ");
                 append_videoflip(launch, &videoflip[0], &videoflip[1]);
                 g_string_append(launch, converter);
-                g_string_append(launch, " ! ");
-                g_string_append(launch, "videoscale ! ");
-                if (jpeg_pipeline) {
-                    g_string_append(launch, " imagefreeze allow-replace=TRUE ! textoverlay name=metadata_overlay ! ");
-                }
-                g_string_append(launch, videosink);
-                g_string_append(launch, " name=");
-                g_string_append(launch, videosink);
-                g_string_append(launch, "_");
-                g_string_append(launch, renderer_type[i]->codec);
-                g_string_append(launch, videosink_options);
-                if (video_sync && !jpeg_pipeline) {
-                    g_string_append(launch, " sync=true");
-                    sync = true;
-                } else {
+                bool isAppsink = (strcmp(videosink, "appsink") == 0);
+                if (isAppsink) {
+                    g_string_append(launch, " ! video/x-raw,format=RGBA ! appsink name=");
+                    g_string_append(launch, videosink);
+                    g_string_append(launch, "_");
+                    g_string_append(launch, renderer_type[i]->codec);
                     g_string_append(launch, " sync=false");
                     sync = false;
+                } else {
+                    g_string_append(launch, " ! videoscale ! ");
+                    if (jpeg_pipeline) {
+                        g_string_append(launch, " imagefreeze allow-replace=TRUE ! textoverlay name=metadata_overlay ! ");
+                    }
+                    g_string_append(launch, videosink);
+                    g_string_append(launch, " name=");
+                    g_string_append(launch, videosink);
+                    g_string_append(launch, "_");
+                    g_string_append(launch, renderer_type[i]->codec);
+                    g_string_append(launch, videosink_options);
+                    if (video_sync && !jpeg_pipeline) {
+                        g_string_append(launch, " sync=true");
+                        sync = true;
+                    } else {
+                        g_string_append(launch, " sync=false");
+                        sync = false;
+                    }
                 }
             }
             if (!strcmp(renderer_type[i]->codec, h264)) {
@@ -1221,6 +1230,11 @@ void video_renderer_set_window_handle(void *handle) {
 void video_renderer_set_force_aspect_ratio(bool enabled) {
     g_force_aspect_ratio = enabled;
     apply_stored_window_handle();
+}
+
+void *video_renderer_get_pipeline(void) {
+    if (!renderer || !renderer->pipeline) return NULL;
+    return renderer->pipeline;
 }
 
 bool video_renderer_get_force_aspect_ratio(void) {

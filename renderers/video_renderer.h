@@ -77,6 +77,7 @@ bool video_renderer_eos_watch();
 void video_renderer_set_window_handle(void *handle);
 void video_renderer_set_force_aspect_ratio(bool enabled);
 bool video_renderer_get_force_aspect_ratio(void);
+void *video_renderer_get_pipeline(void);
 #ifdef __cplusplus
 }
 #endif
