@@ -22,6 +22,7 @@
 
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
 #include <gst/video/videooverlay.h>
 #include "video_renderer.h"
 #include "sample_tap.h"
@@ -97,7 +98,8 @@ typedef enum {
 #define NCODECS  3   /* renderers for h264,h265, and jpeg images */
 
 struct video_renderer_s {
-    GstElement *appsrc, *pipeline, *textsrc;
+    GstElement *appsrc, *pipeline, *textsrc, *recording_sink;
+    gulong recording_sample_handler;
     GstBus *bus;
     const char *codec;
     bool autovideo;
@@ -112,6 +114,21 @@ struct video_renderer_s {
     X11_Window_t * gst_window;
 #endif
 };
+
+static GstFlowReturn video_renderer_recording_new_sample(GstAppSink *sink,
+                                                         gpointer user_data) {
+    video_renderer_t *sample_renderer = user_data;
+    GstSample *sample;
+
+    g_assert(sample_renderer != NULL);
+    sample = gst_app_sink_pull_sample(sink);
+    if (!sample) {
+        return GST_FLOW_EOS;
+    }
+    sample_tap_emit(video_renderer_get_sample_tap(), sample);
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
 
 static video_renderer_t *renderer = NULL;
 static video_renderer_t *renderer_type[NCODECS] = {0};
@@ -299,6 +316,8 @@ int video_renderer_init(logger_t *render_logger, const char *server_name, videof
         renderer_type[i]->bus = NULL;
         renderer_type[i]->appsrc = NULL;
         renderer_type[i]->textsrc = NULL;
+        renderer_type[i]->recording_sink = NULL;
+        renderer_type[i]->recording_sample_handler = 0;
         renderer_type[i]->uri = NULL;
         renderer_type[i]->eos = FALSE;
         if (hls_video) {
@@ -368,8 +387,43 @@ int video_renderer_init(logger_t *render_logger, const char *server_name, videof
                 g_string_append(launch, " ! ");
                 append_videoflip(launch, &videoflip[0], &videoflip[1]);
                 g_string_append(launch, converter);
+                bool raw_tap_enabled = !jpeg_pipeline && !rtp &&
+                                       sample_tap_is_enabled(video_renderer_get_sample_tap());
                 bool isAppsink = (strcmp(videosink, "appsink") == 0);
-                if (isAppsink) {
+                if (raw_tap_enabled) {
+                    g_string_append(launch, " ! video/x-raw,format=RGBA ! tee name=video_raw_tee_");
+                    g_string_append(launch, renderer_type[i]->codec);
+                    g_string_append(launch, " video_raw_tee_");
+                    g_string_append(launch, renderer_type[i]->codec);
+                    if (isAppsink) {
+                        g_string_append(launch, ". ! queue ! appsink name=appsink_");
+                        g_string_append(launch, renderer_type[i]->codec);
+                        g_string_append(launch, " sync=false");
+                        sync = false;
+                    } else {
+                        g_string_append(launch, ". ! queue ! videoscale ! ");
+                        g_string_append(launch, videosink);
+                        g_string_append(launch, " name=");
+                        g_string_append(launch, videosink);
+                        g_string_append(launch, "_");
+                        g_string_append(launch, renderer_type[i]->codec);
+                        g_string_append(launch, videosink_options);
+                        if (video_sync) {
+                            g_string_append(launch, " sync=true");
+                            sync = true;
+                        } else {
+                            g_string_append(launch, " sync=false");
+                            sync = false;
+                        }
+                    }
+                    g_string_append(launch, " video_raw_tee_");
+                    g_string_append(launch, renderer_type[i]->codec);
+                    g_string_append(launch, ". ! queue name=recording_video_queue_");
+                    g_string_append(launch, renderer_type[i]->codec);
+                    g_string_append(launch, " leaky=downstream max-size-buffers=2 ! appsink name=recording_video_sink_");
+                    g_string_append(launch, renderer_type[i]->codec);
+                    g_string_append(launch, " emit-signals=true max-buffers=2 drop=true sync=false");
+                } else if (isAppsink) {
                     g_string_append(launch, " ! video/x-raw,format=RGBA ! appsink name=");
                     g_string_append(launch, videosink);
                     g_string_append(launch, "_");
@@ -433,6 +487,20 @@ int video_renderer_init(logger_t *render_logger, const char *server_name, videof
                 return -1;
             }
             g_object_set(renderer_type[i]->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+            if (!jpeg_pipeline && !rtp &&
+                sample_tap_is_enabled(video_renderer_get_sample_tap())) {
+                gchar *recording_sink_name = g_strdup_printf("recording_video_sink_%s",
+                                                              renderer_type[i]->codec);
+                renderer_type[i]->recording_sink = gst_bin_get_by_name(
+                    GST_BIN(renderer_type[i]->pipeline), recording_sink_name);
+                g_free(recording_sink_name);
+                g_assert(renderer_type[i]->recording_sink != NULL);
+                renderer_type[i]->recording_sample_handler = g_signal_connect(
+                    renderer_type[i]->recording_sink,
+                    "new-sample",
+                    G_CALLBACK(video_renderer_recording_new_sample),
+                    renderer_type[i]);
+            }
             g_string_free(launch, TRUE);
             gst_caps_unref(caps);
             gst_object_unref(clock);
@@ -651,9 +719,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
         buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
         g_assert(buffer != NULL);
         //g_print("video latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
-        if (sync) {
-            GST_BUFFER_PTS(buffer) = pts;
-        }
+        GST_BUFFER_PTS(buffer) = pts;
         gst_buffer_fill(buffer, 0, data, *data_len);
         gst_app_src_push_buffer (GST_APP_SRC(renderer->appsrc), buffer);
 #ifdef X_DISPLAY_FIX
@@ -740,6 +806,11 @@ void video_renderer_set_track_metadata(const char *title, const char *artist, co
 static void video_renderer_destroy_instance(video_renderer_t *renderer) {
     if (renderer) {
         logger_log(logger, LOGGER_DEBUG,"destroying renderer instance %p codec=%s ", renderer, renderer->codec);
+        if (renderer->recording_sink && renderer->recording_sample_handler) {
+            g_signal_handler_disconnect(renderer->recording_sink,
+                                        renderer->recording_sample_handler);
+            renderer->recording_sample_handler = 0;
+        }
         if (renderer->pipeline) {
             GstState state;
             GstStateChangeReturn ret;
@@ -757,6 +828,10 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
             }
             gst_object_unref(renderer->bus);
             gst_object_unref(renderer->pipeline);
+        }
+        if (renderer->recording_sink) {
+            gst_object_unref(renderer->recording_sink);
+            renderer->recording_sink = NULL;
         }
         if (renderer->appsrc) {
             gst_object_unref (renderer->appsrc);
