@@ -24,6 +24,7 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/video/videooverlay.h>
 #include "video_renderer.h"
+#include "sample_tap.h"
 
 #define SECOND_IN_NSECS 1000000000UL
 #define SECOND_IN_MICROSECS 1000000
@@ -60,6 +61,20 @@ static int type_hls = 0;
 static int type_jpeg = 0;
 static guintptr g_window_handle = 0;
 static bool g_force_aspect_ratio = false;
+static sample_tap_t video_sample_tap;
+static gsize video_sample_tap_initialized = 0;
+
+static sample_tap_t *video_renderer_get_sample_tap(void) {
+    if (g_once_init_enter(&video_sample_tap_initialized)) {
+        sample_tap_init(&video_sample_tap);
+        g_once_init_leave(&video_sample_tap_initialized, 1);
+    }
+    return &video_sample_tap;
+}
+
+void video_renderer_set_sample_callback(renderer_sample_callback_t callback, void *context) {
+    sample_tap_set(video_renderer_get_sample_tap(), callback, context);
+}
 
 static void apply_stored_window_handle(void);
 

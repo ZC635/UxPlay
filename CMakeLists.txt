@@ -5,6 +5,7 @@ project( uxplay )
 message( STATUS "Project name: " ${PROJECT_NAME} )
 
 include(GNUInstallDirs)
+include(CTest)
 
 set ( CMAKE_CXX_STANDARD 11 )
 
@@ -53,6 +54,10 @@ add_subdirectory( lib/llhttp )
 add_subdirectory( lib/playfair )
 add_subdirectory( lib )
 add_subdirectory( renderers )
+
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+endif()
 
 if  ( GST_MACOS )
      add_definitions( -DGST_MACOS )

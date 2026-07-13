@@ -30,7 +30,22 @@ extern "C" {
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <gst/gst.h>
 #include "../lib/logger.h"
+
+/*
+ * The callback receives a borrowed GstSample. A consumer that retains the
+ * sample after the callback returns must call gst_sample_ref(). Call the
+ * setter only from outside the sample callback. To replace an active callback
+ * or context, disable it with (NULL, NULL), wait for that call to return, then
+ * register the replacement; the old context may be freed after disable
+ * returns. Register before renderer initialization and disable before renderer
+ * destruction.
+ */
+#ifndef RENDERER_SAMPLE_CALLBACK_T_DEFINED
+#define RENDERER_SAMPLE_CALLBACK_T_DEFINED
+typedef void (*renderer_sample_callback_t)(GstSample *sample, void *context);
+#endif
 
 bool gstreamer_init();
 int audio_renderer_init(logger_t *logger, const char* audiosink, const bool *audio_sync, const bool *video_sync, const char *artp_pipeline);
@@ -41,6 +56,7 @@ void audio_renderer_set_volume(double volume);
 void audio_renderer_flush();
 void audio_renderer_destroy();
 unsigned int audio_renderer_listen(void *loop, int id);
+void audio_renderer_set_sample_callback(renderer_sample_callback_t callback, void *context);
 #ifdef __cplusplus
 }
 #endif

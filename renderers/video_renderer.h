@@ -34,7 +34,22 @@ extern "C" {
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <gst/gst.h>
 #include "../lib/logger.h"
+
+/*
+ * The callback receives a borrowed GstSample. A consumer that retains the
+ * sample after the callback returns must call gst_sample_ref(). Call the
+ * setter only from outside the sample callback. To replace an active callback
+ * or context, disable it with (NULL, NULL), wait for that call to return, then
+ * register the replacement; the old context may be freed after disable
+ * returns. Register before renderer initialization and disable before renderer
+ * destruction.
+ */
+#ifndef RENDERER_SAMPLE_CALLBACK_T_DEFINED
+#define RENDERER_SAMPLE_CALLBACK_T_DEFINED
+typedef void (*renderer_sample_callback_t)(GstSample *sample, void *context);
+#endif
 
 typedef enum videoflip_e {
     NONE,
@@ -78,6 +93,7 @@ void video_renderer_set_window_handle(void *handle);
 void video_renderer_set_force_aspect_ratio(bool enabled);
 bool video_renderer_get_force_aspect_ratio(void);
 void *video_renderer_get_pipeline(void);
+void video_renderer_set_sample_callback(renderer_sample_callback_t callback, void *context);
 #ifdef __cplusplus
 }
 #endif

@@ -24,6 +24,7 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include "audio_renderer.h"
+#include "sample_tap.h"
 #define SECOND_IN_NSECS 1000000000UL
 
 #define NFORMATS 2     /* set to 4 to enable AAC_LD and PCM:  allowed, but  never seen in real-world use */
@@ -41,6 +42,20 @@ static gboolean async = FALSE;
 static gboolean vsync = FALSE;
 static gboolean sync = FALSE;
 static gboolean audio_rtp = FALSE;
+static sample_tap_t audio_sample_tap;
+static gsize audio_sample_tap_initialized = 0;
+
+static sample_tap_t *audio_renderer_get_sample_tap(void) {
+    if (g_once_init_enter(&audio_sample_tap_initialized)) {
+        sample_tap_init(&audio_sample_tap);
+        g_once_init_leave(&audio_sample_tap_initialized, 1);
+    }
+    return &audio_sample_tap;
+}
+
+void audio_renderer_set_sample_callback(renderer_sample_callback_t callback, void *context) {
+    sample_tap_set(audio_renderer_get_sample_tap(), callback, context);
+}
 
 typedef struct audio_renderer_s {
     GstElement *appsrc; 
