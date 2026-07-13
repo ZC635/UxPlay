@@ -49,6 +49,7 @@ static GPtrArray *capture_audio_pipeline_logs(gboolean tap_enabled,
                     0);
     audio_renderer_set_sample_callback(NULL, NULL);
     audio_renderer_destroy();
+    g_assert_null(audio_renderer_get_pipeline());
     logger_set_callback(test_logger, discard_log_message, NULL);
     logger_set_level(test_logger, LOGGER_ERR);
     return capture.messages;
@@ -425,6 +426,7 @@ static void test_only_active_audio_renderer_emits_samples(void) {
 
     audio_renderer_set_sample_callback(NULL, NULL);
     audio_renderer_destroy();
+    g_assert_null(audio_renderer_get_pipeline());
     logger_set_callback(test_logger, discard_log_message, NULL);
     logger_set_level(test_logger, LOGGER_ERR);
 
@@ -441,6 +443,482 @@ static void test_only_active_audio_renderer_emits_samples(void) {
                                    "changed audio connection, format AAC-ELD 44100/2"));
     g_test_message("AAC-ELD data-level decode skipped: no deterministic valid fixture");
     g_ptr_array_unref(logs.messages);
+}
+
+typedef struct slow_audio_state_s {
+    GMutex mutex;
+    GCond changed;
+    guint playback_calls;
+    guint tap_calls;
+} slow_audio_state_t;
+
+static void slow_audio_tap_callback(GstSample *sample, void *context) {
+    slow_audio_state_t *state = context;
+
+    g_assert_nonnull(sample);
+    g_mutex_lock(&state->mutex);
+    state->tap_calls++;
+    g_cond_broadcast(&state->changed);
+    g_mutex_unlock(&state->mutex);
+    g_usleep(250 * G_TIME_SPAN_MILLISECOND);
+}
+
+static void playback_fakesink_handoff(GstElement *sink,
+                                      GstBuffer *buffer,
+                                      GstPad *pad,
+                                      gpointer context) {
+    slow_audio_state_t *state = context;
+
+    g_assert_nonnull(sink);
+    g_assert_nonnull(buffer);
+    g_assert_nonnull(pad);
+    g_mutex_lock(&state->mutex);
+    state->playback_calls++;
+    g_cond_broadcast(&state->changed);
+    g_mutex_unlock(&state->mutex);
+}
+
+static gboolean wait_for_playback_buffers(slow_audio_state_t *state,
+                                          guint expected) {
+    gint64 deadline = g_get_monotonic_time() + (5 * G_TIME_SPAN_SECOND);
+    gboolean complete;
+
+    g_mutex_lock(&state->mutex);
+    while (state->playback_calls < expected &&
+           g_cond_wait_until(&state->changed, &state->mutex, deadline)) {
+    }
+    complete = state->playback_calls >= expected;
+    g_mutex_unlock(&state->mutex);
+    return complete;
+}
+
+static void test_slow_audio_tap_does_not_block_playback_pushes(void) {
+    slow_audio_state_t state = {0};
+    bool audio_sync = false;
+    bool video_sync = false;
+    guint8 compression_type = 1;
+    gint16 pcm[441 * 2];
+    GstElement *pipeline;
+    GstElement *playback_sink;
+    GstElement *recording_queue;
+    GstElement *recording_sink;
+    gulong handoff_handler;
+    gint queue_leaky = 0;
+    guint queue_max_buffers = 0;
+    guint sink_max_buffers = 0;
+    gboolean sink_drop = FALSE;
+    gboolean sink_sync = TRUE;
+
+    memset(pcm, 0x3c, sizeof(pcm));
+    g_mutex_init(&state.mutex);
+    g_cond_init(&state.changed);
+    audio_renderer_set_sample_callback(slow_audio_tap_callback, &state);
+    g_assert_cmpint(audio_renderer_init(test_logger,
+                                        "fakesink name=playback_sink signal-handoffs=true",
+                                        &audio_sync,
+                                        &video_sync,
+                                        ""),
+                    ==,
+                    0);
+    audio_renderer_start(&compression_type);
+    pipeline = GST_ELEMENT(audio_renderer_get_pipeline());
+    g_assert_nonnull(pipeline);
+    playback_sink = gst_bin_get_by_name(GST_BIN(pipeline), "playback_sink");
+    recording_queue = gst_bin_get_by_name(GST_BIN(pipeline),
+                                           "recording_audio_queue_1");
+    recording_sink = gst_bin_get_by_name(GST_BIN(pipeline),
+                                          "recording_audio_sink_1");
+    g_assert_nonnull(playback_sink);
+    g_assert_nonnull(recording_queue);
+    g_assert_nonnull(recording_sink);
+    handoff_handler = g_signal_connect(playback_sink,
+                                       "handoff",
+                                       G_CALLBACK(playback_fakesink_handoff),
+                                       &state);
+    g_object_get(recording_queue,
+                 "leaky", &queue_leaky,
+                 "max-size-buffers", &queue_max_buffers,
+                 NULL);
+    g_object_get(recording_sink,
+                 "max-buffers", &sink_max_buffers,
+                 "drop", &sink_drop,
+                 "sync", &sink_sync,
+                 NULL);
+    g_assert_cmpint(queue_leaky, ==, 2);
+    g_assert_cmpuint(queue_max_buffers, ==, 8);
+    g_assert_cmpuint(sink_max_buffers, ==, 8);
+    g_assert_true(sink_drop);
+    g_assert_false(sink_sync);
+
+    gint64 push_started = g_get_monotonic_time();
+    for (guint i = 0; i < 100; i++) {
+        int data_len = sizeof(pcm);
+        unsigned short sequence = (unsigned short)i;
+        uint64_t remote_pts = (30 * GST_SECOND) + (i * 10 * GST_MSECOND);
+        audio_renderer_render_buffer((guint8 *)pcm,
+                                     &data_len,
+                                     &sequence,
+                                     &remote_pts);
+    }
+    gint64 push_elapsed = g_get_monotonic_time() - push_started;
+    gboolean playback_complete = wait_for_playback_buffers(&state, 100);
+
+    audio_renderer_set_sample_callback(NULL, NULL);
+    g_signal_handler_disconnect(playback_sink, handoff_handler);
+    audio_renderer_destroy();
+    g_mutex_lock(&state.mutex);
+    guint playback_calls = state.playback_calls;
+    guint tap_calls = state.tap_calls;
+    g_mutex_unlock(&state.mutex);
+    gst_object_unref(recording_sink);
+    gst_object_unref(recording_queue);
+    gst_object_unref(playback_sink);
+    g_cond_clear(&state.changed);
+    g_mutex_clear(&state.mutex);
+
+    g_test_message("100 audio pushes took %.3f ms; playback=%u; tap=%u",
+                   push_elapsed / 1000.0,
+                   playback_calls,
+                   tap_calls);
+    g_assert_cmpint(push_elapsed, <, 500 * G_TIME_SPAN_MILLISECOND);
+    g_assert_true(playback_complete);
+    g_assert_cmpuint(playback_calls, ==, 100);
+    g_assert_cmpuint(tap_calls, <, 100);
+}
+
+typedef struct sample_lifetime_state_s {
+    GMutex mutex;
+    GCond changed;
+    GstSample *retained_sample;
+    guint calls;
+    gboolean readable_in_callback;
+    gboolean destroyed;
+    gint refcount_after_callback_ref;
+} sample_lifetime_state_t;
+
+static void renderer_sample_destroyed(gpointer context, GstMiniObject *object) {
+    sample_lifetime_state_t *state = context;
+
+    g_assert_nonnull(object);
+    g_mutex_lock(&state->mutex);
+    state->destroyed = TRUE;
+    g_cond_broadcast(&state->changed);
+    g_mutex_unlock(&state->mutex);
+}
+
+static gboolean sample_is_readable(GstSample *sample) {
+    GstCaps *caps = gst_sample_get_caps(sample);
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    GstMapInfo map;
+    gboolean mapped;
+
+    if (!caps || !buffer) {
+        return FALSE;
+    }
+    mapped = gst_buffer_map(buffer, &map, GST_MAP_READ);
+    if (mapped) {
+        gst_buffer_unmap(buffer, &map);
+    }
+    return mapped;
+}
+
+static void retain_renderer_sample_callback(GstSample *sample, void *context) {
+    sample_lifetime_state_t *state = context;
+
+    g_mutex_lock(&state->mutex);
+    g_assert_null(state->retained_sample);
+    state->readable_in_callback = sample_is_readable(sample);
+    state->retained_sample = gst_sample_ref(sample);
+    state->refcount_after_callback_ref =
+        GST_MINI_OBJECT_REFCOUNT_VALUE(state->retained_sample);
+    gst_mini_object_weak_ref(GST_MINI_OBJECT(sample),
+                             renderer_sample_destroyed,
+                             state);
+    state->calls++;
+    g_cond_broadcast(&state->changed);
+    g_mutex_unlock(&state->mutex);
+}
+
+static void borrow_renderer_sample_callback(GstSample *sample, void *context) {
+    sample_lifetime_state_t *state = context;
+
+    g_mutex_lock(&state->mutex);
+    state->readable_in_callback &= sample_is_readable(sample);
+    gst_mini_object_weak_ref(GST_MINI_OBJECT(sample),
+                             renderer_sample_destroyed,
+                             state);
+    state->calls++;
+    g_cond_broadcast(&state->changed);
+    g_mutex_unlock(&state->mutex);
+}
+
+static gboolean wait_for_lifetime_calls(sample_lifetime_state_t *state,
+                                        guint expected) {
+    gint64 deadline = g_get_monotonic_time() + (5 * G_TIME_SPAN_SECOND);
+    gboolean complete;
+
+    g_mutex_lock(&state->mutex);
+    while (state->calls < expected &&
+           g_cond_wait_until(&state->changed, &state->mutex, deadline)) {
+    }
+    complete = state->calls >= expected;
+    g_mutex_unlock(&state->mutex);
+    return complete;
+}
+
+static gboolean wait_for_sample_destroyed(sample_lifetime_state_t *state) {
+    gint64 deadline = g_get_monotonic_time() + (5 * G_TIME_SPAN_SECOND);
+    gboolean destroyed;
+
+    g_mutex_lock(&state->mutex);
+    while (!state->destroyed &&
+           g_cond_wait_until(&state->changed, &state->mutex, deadline)) {
+    }
+    destroyed = state->destroyed;
+    g_mutex_unlock(&state->mutex);
+    return destroyed;
+}
+
+static void push_pcm_audio_buffer(guint sequence_number, uint64_t remote_pts) {
+    gint16 pcm[441 * 2];
+    int data_len = sizeof(pcm);
+    unsigned short sequence = (unsigned short)sequence_number;
+
+    memset(pcm, 0x5a, sizeof(pcm));
+    audio_renderer_render_buffer((guint8 *)pcm,
+                                 &data_len,
+                                 &sequence,
+                                 &remote_pts);
+}
+
+static void test_renderer_audio_sample_borrowed_and_retained_lifetimes(void) {
+    sample_lifetime_state_t state = {0};
+    bool audio_sync = false;
+    bool video_sync = false;
+    guint8 compression_type = 1;
+
+    g_mutex_init(&state.mutex);
+    g_cond_init(&state.changed);
+    state.readable_in_callback = TRUE;
+    audio_renderer_set_sample_callback(retain_renderer_sample_callback, &state);
+    g_assert_cmpint(audio_renderer_init(test_logger,
+                                        "fakesink",
+                                        &audio_sync,
+                                        &video_sync,
+                                        ""),
+                    ==,
+                    0);
+    audio_renderer_start(&compression_type);
+    push_pcm_audio_buffer(1, 40 * GST_SECOND);
+    g_assert_true(wait_for_lifetime_calls(&state, 1));
+    audio_renderer_set_sample_callback(NULL, NULL);
+
+    g_mutex_lock(&state.mutex);
+    GstSample *retained = state.retained_sample;
+    gboolean readable_in_callback = state.readable_in_callback;
+    gint refcount_after_callback_ref = state.refcount_after_callback_ref;
+    g_mutex_unlock(&state.mutex);
+    g_assert_nonnull(retained);
+    g_assert_true(readable_in_callback);
+    g_assert_true(sample_is_readable(retained));
+    gint refcount_after_clear = GST_MINI_OBJECT_REFCOUNT_VALUE(retained);
+    g_test_message("retained GstSample refs: callback-after-ref=%d clear-return=%d",
+                   refcount_after_callback_ref,
+                   refcount_after_clear);
+    audio_renderer_destroy();
+    gint refcount_after_destroy = GST_MINI_OBJECT_REFCOUNT_VALUE(retained);
+    g_test_message("retained GstSample refs after renderer destroy=%d",
+                   refcount_after_destroy);
+    g_assert_cmpint(refcount_after_destroy, ==, 1);
+    g_assert_true(sample_is_readable(retained));
+    gst_sample_unref(retained);
+    g_mutex_lock(&state.mutex);
+    state.retained_sample = NULL;
+    g_mutex_unlock(&state.mutex);
+    g_assert_true(wait_for_sample_destroyed(&state));
+
+    g_mutex_lock(&state.mutex);
+    state.destroyed = FALSE;
+    g_mutex_unlock(&state.mutex);
+    audio_renderer_set_sample_callback(borrow_renderer_sample_callback, &state);
+    g_assert_cmpint(audio_renderer_init(test_logger,
+                                        "fakesink",
+                                        &audio_sync,
+                                        &video_sync,
+                                        ""),
+                    ==,
+                    0);
+    audio_renderer_start(&compression_type);
+    push_pcm_audio_buffer(2, (40 * GST_SECOND) + (10 * GST_MSECOND));
+    g_assert_true(wait_for_lifetime_calls(&state, 2));
+    audio_renderer_set_sample_callback(NULL, NULL);
+    audio_renderer_destroy();
+    g_assert_true(wait_for_sample_destroyed(&state));
+
+    g_mutex_lock(&state.mutex);
+    guint calls = state.calls;
+    readable_in_callback = state.readable_in_callback;
+    g_mutex_unlock(&state.mutex);
+    g_cond_clear(&state.changed);
+    g_mutex_clear(&state.mutex);
+    g_assert_cmpuint(calls, ==, 2);
+    g_assert_true(readable_in_callback);
+}
+
+typedef struct renderer_blocking_state_s {
+    GMutex mutex;
+    GCond changed;
+    gboolean entered;
+    gboolean release;
+    gboolean exited;
+    gboolean context_valid;
+    gboolean called_after_release;
+    guint calls;
+} renderer_blocking_state_t;
+
+typedef struct renderer_clear_state_s {
+    GMutex mutex;
+    GCond changed;
+    gboolean started;
+    gboolean returned;
+} renderer_clear_state_t;
+
+static void blocking_renderer_audio_callback(GstSample *sample, void *context) {
+    renderer_blocking_state_t *state = context;
+    gint64 deadline = g_get_monotonic_time() + (5 * G_TIME_SPAN_SECOND);
+
+    g_assert_nonnull(sample);
+    g_mutex_lock(&state->mutex);
+    state->calls++;
+    if (!state->context_valid) {
+        state->called_after_release = TRUE;
+    }
+    state->entered = TRUE;
+    g_cond_broadcast(&state->changed);
+    while (!state->release &&
+           g_cond_wait_until(&state->changed, &state->mutex, deadline)) {
+    }
+    state->exited = TRUE;
+    g_cond_broadcast(&state->changed);
+    g_mutex_unlock(&state->mutex);
+}
+
+static gpointer clear_audio_renderer_callback_thread(gpointer context) {
+    renderer_clear_state_t *state = context;
+
+    g_mutex_lock(&state->mutex);
+    state->started = TRUE;
+    g_cond_broadcast(&state->changed);
+    g_mutex_unlock(&state->mutex);
+    audio_renderer_set_sample_callback(NULL, NULL);
+    g_mutex_lock(&state->mutex);
+    state->returned = TRUE;
+    g_cond_broadcast(&state->changed);
+    g_mutex_unlock(&state->mutex);
+    return NULL;
+}
+
+static gboolean wait_for_unexpected_renderer_callback(
+    renderer_blocking_state_t *state,
+    guint baseline) {
+    gint64 deadline = g_get_monotonic_time() +
+                      (500 * G_TIME_SPAN_MILLISECOND);
+    gboolean changed;
+
+    g_mutex_lock(&state->mutex);
+    while (state->calls == baseline &&
+           g_cond_wait_until(&state->changed, &state->mutex, deadline)) {
+    }
+    changed = state->calls != baseline;
+    g_mutex_unlock(&state->mutex);
+    return changed;
+}
+
+static void test_public_audio_clear_drains_renderer_callback(void) {
+    renderer_blocking_state_t callback = {0};
+    renderer_clear_state_t clear = {0};
+    bool audio_sync = false;
+    bool video_sync = false;
+    guint8 compression_type = 1;
+    GThread *clear_thread;
+    gboolean clear_returned_while_blocked;
+
+    g_mutex_init(&callback.mutex);
+    g_cond_init(&callback.changed);
+    g_mutex_init(&clear.mutex);
+    g_cond_init(&clear.changed);
+    callback.context_valid = TRUE;
+    audio_renderer_set_sample_callback(blocking_renderer_audio_callback,
+                                       &callback);
+    g_assert_cmpint(audio_renderer_init(test_logger,
+                                        "fakesink",
+                                        &audio_sync,
+                                        &video_sync,
+                                        ""),
+                    ==,
+                    0);
+    audio_renderer_start(&compression_type);
+    push_pcm_audio_buffer(1, 50 * GST_SECOND);
+
+    g_mutex_lock(&callback.mutex);
+    gint64 deadline = g_get_monotonic_time() + (5 * G_TIME_SPAN_SECOND);
+    while (!callback.entered &&
+           g_cond_wait_until(&callback.changed, &callback.mutex, deadline)) {
+    }
+    gboolean entered = callback.entered;
+    g_mutex_unlock(&callback.mutex);
+    g_assert_true(entered);
+
+    clear_thread = g_thread_new("renderer-audio-clear",
+                                clear_audio_renderer_callback_thread,
+                                &clear);
+    g_mutex_lock(&clear.mutex);
+    deadline = g_get_monotonic_time() + (5 * G_TIME_SPAN_SECOND);
+    while (!clear.started &&
+           g_cond_wait_until(&clear.changed, &clear.mutex, deadline)) {
+    }
+    gboolean clear_started = clear.started;
+    deadline = g_get_monotonic_time() + (250 * G_TIME_SPAN_MILLISECOND);
+    while (!clear.returned &&
+           g_cond_wait_until(&clear.changed, &clear.mutex, deadline)) {
+    }
+    clear_returned_while_blocked = clear.returned;
+    g_mutex_unlock(&clear.mutex);
+
+    g_mutex_lock(&callback.mutex);
+    callback.release = TRUE;
+    g_cond_broadcast(&callback.changed);
+    g_mutex_unlock(&callback.mutex);
+    g_thread_join(clear_thread);
+
+    g_mutex_lock(&callback.mutex);
+    callback.context_valid = FALSE;
+    guint calls_before_extra_push = callback.calls;
+    gboolean callback_exited = callback.exited;
+    g_mutex_unlock(&callback.mutex);
+    push_pcm_audio_buffer(2, (50 * GST_SECOND) + (10 * GST_MSECOND));
+    g_assert_false(wait_for_unexpected_renderer_callback(&callback,
+                                                         calls_before_extra_push));
+    audio_renderer_destroy();
+
+    g_mutex_lock(&callback.mutex);
+    guint calls = callback.calls;
+    gboolean called_after_release = callback.called_after_release;
+    g_mutex_unlock(&callback.mutex);
+    g_mutex_lock(&clear.mutex);
+    gboolean clear_returned = clear.returned;
+    g_mutex_unlock(&clear.mutex);
+    g_cond_clear(&clear.changed);
+    g_mutex_clear(&clear.mutex);
+    g_cond_clear(&callback.changed);
+    g_mutex_clear(&callback.mutex);
+
+    g_assert_true(clear_started);
+    g_assert_false(clear_returned_while_blocked);
+    g_assert_true(callback_exited);
+    g_assert_true(clear_returned);
+    g_assert_cmpuint(calls, ==, 1);
+    g_assert_false(called_after_release);
 }
 
 typedef struct video_capture_s {
@@ -710,6 +1188,26 @@ static gboolean push_access_units(GPtrArray *buffers, video_capture_t *capture) 
     return TRUE;
 }
 
+static gboolean push_one_video_access_unit(GstBuffer *encoded,
+                                           uint64_t remote_pts,
+                                           video_capture_t *capture,
+                                           guint expected_calls) {
+    GstMapInfo map;
+    int data_len;
+    int nal_count = 1;
+
+    g_assert_true(gst_buffer_map(encoded, &map, GST_MAP_READ));
+    data_len = (int)map.size;
+    g_assert_cmpuint(video_renderer_render_buffer(map.data,
+                                                  &data_len,
+                                                  &nal_count,
+                                                  &remote_pts),
+                     ==,
+                     0);
+    gst_buffer_unmap(encoded, &map);
+    return wait_for_video_samples(capture, expected_calls);
+}
+
 static void test_video_tap_h264_samples_are_rgba_with_monotonic_pts(void) {
     videoflip_t flip[2] = {NONE, NONE};
     video_capture_t capture = {0};
@@ -873,6 +1371,108 @@ static void test_only_selected_video_renderer_emits_samples(void) {
     assert_access_units_are_self_contained(h265_buffers, TRUE);
     run_selected_video_renderer_case(h265_buffers, TRUE, "avdec_h264");
     g_ptr_array_unref(h265_buffers);
+}
+
+static void test_video_tap_survives_stop_destroy_and_codec_reset(void) {
+    videoflip_t flip[2] = {NONE, NONE};
+    video_capture_t capture = {0};
+    GPtrArray *h264_buffers;
+    GPtrArray *h265_buffers;
+
+    if (!have_gst_factory("videotestsrc") ||
+        !have_gst_factory("videoconvert") ||
+        !have_gst_factory("openh264enc") ||
+        !have_gst_factory("x265enc") ||
+        !have_gst_factory("h264parse") ||
+        !have_gst_factory("h265parse") ||
+        !have_gst_factory("avdec_h264") ||
+        !have_gst_factory("avdec_h265") ||
+        !have_gst_factory("appsink")) {
+        g_test_skip("H.264/H.265 reset-test plugins are unavailable");
+        return;
+    }
+    h264_buffers = generate_h264_access_units();
+    h265_buffers = generate_h265_access_units();
+    assert_access_units_are_self_contained(h264_buffers, FALSE);
+    assert_access_units_are_self_contained(h265_buffers, TRUE);
+    g_mutex_init(&capture.mutex);
+    g_cond_init(&capture.changed);
+    capture.all_rgba = TRUE;
+    capture.all_pts_valid = TRUE;
+
+    video_renderer_set_sample_callback(capture_video_sample, &capture);
+    g_assert_cmpint(video_renderer_init(test_logger,
+                                        "RendererSampleTapsTest",
+                                        flip,
+                                        "h264parse",
+                                        "",
+                                        "avdec_h264",
+                                        "videoconvert",
+                                        "appsink",
+                                        "",
+                                        FALSE,
+                                        FALSE,
+                                        TRUE,
+                                        FALSE,
+                                        3,
+                                        NULL),
+                    ==,
+                    0);
+    g_assert_cmpint(video_renderer_choose_codec(FALSE, FALSE), ==, 0);
+    g_assert_true(push_one_video_access_unit(g_ptr_array_index(h264_buffers, 0),
+                                             60 * GST_SECOND,
+                                             &capture,
+                                             1));
+    video_renderer_stop();
+    video_renderer_start();
+    g_assert_cmpint(video_renderer_choose_codec(FALSE, FALSE), ==, 0);
+    g_assert_true(push_one_video_access_unit(g_ptr_array_index(h264_buffers, 1),
+                                             (60 * GST_SECOND) +
+                                                 (GST_SECOND / 30),
+                                             &capture,
+                                             2));
+    video_renderer_set_sample_callback(NULL, NULL);
+    video_renderer_destroy();
+    g_assert_null(video_renderer_get_pipeline());
+
+    video_renderer_set_sample_callback(capture_video_sample, &capture);
+    g_assert_cmpint(video_renderer_init(test_logger,
+                                        "RendererSampleTapsTest",
+                                        flip,
+                                        "h264parse",
+                                        "",
+                                        "avdec_h264",
+                                        "videoconvert",
+                                        "appsink",
+                                        "",
+                                        FALSE,
+                                        FALSE,
+                                        TRUE,
+                                        FALSE,
+                                        3,
+                                        NULL),
+                    ==,
+                    0);
+    g_assert_cmpint(video_renderer_choose_codec(FALSE, TRUE), ==, 0);
+    g_assert_true(push_one_video_access_unit(g_ptr_array_index(h265_buffers, 0),
+                                             61 * GST_SECOND,
+                                             &capture,
+                                             3));
+    video_renderer_set_sample_callback(NULL, NULL);
+    video_renderer_destroy();
+
+    g_mutex_lock(&capture.mutex);
+    guint calls = capture.calls;
+    gboolean all_rgba = capture.all_rgba;
+    gboolean all_pts_valid = capture.all_pts_valid;
+    g_mutex_unlock(&capture.mutex);
+    g_ptr_array_unref(h265_buffers);
+    g_ptr_array_unref(h264_buffers);
+    g_cond_clear(&capture.changed);
+    g_mutex_clear(&capture.mutex);
+    g_assert_cmpuint(calls, ==, 3);
+    g_assert_true(all_rgba);
+    g_assert_true(all_pts_valid);
 }
 
 static GstElement *init_and_choose_video_renderer(gboolean tap_enabled,
@@ -1310,6 +1910,8 @@ int main(int argc, char **argv) {
                     test_video_tap_h264_samples_are_rgba_with_monotonic_pts);
     g_test_add_func("/renderer/video-tap/only-selected-renderer-emits",
                     test_only_selected_video_renderer_emits_samples);
+    g_test_add_func("/renderer/video-tap/stop-destroy-codec-reset",
+                    test_video_tap_survives_stop_destroy_and_codec_reset);
     g_test_add_func("/renderer/audio-tap/default-off-keeps-original-pipeline",
                     test_audio_tap_default_off_keeps_original_pipeline);
     g_test_add_func("/renderer/audio-tap/builds-all-supported-renderers",
@@ -1322,6 +1924,12 @@ int main(int argc, char **argv) {
                     test_audio_tap_pcm_is_pre_volume_s16le_with_monotonic_pts);
     g_test_add_func("/renderer/audio-tap/only-active-renderer-emits",
                     test_only_active_audio_renderer_emits_samples);
+    g_test_add_func("/renderer/audio-tap/slow-consumer-does-not-block-playback",
+                    test_slow_audio_tap_does_not_block_playback_pushes);
+    g_test_add_func("/renderer/audio-tap/borrowed-and-retained-sample-lifetimes",
+                    test_renderer_audio_sample_borrowed_and_retained_lifetimes);
+    g_test_add_func("/renderer/audio-tap/public-clear-drains-callback",
+                    test_public_audio_clear_drains_renderer_callback);
     g_test_add_func("/renderer/sample-taps/registration-api-compiles",
                     test_registration_api_compiles);
     g_test_add_func("/renderer/sample-taps/disabled-after-init",

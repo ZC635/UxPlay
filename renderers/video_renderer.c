@@ -117,10 +117,9 @@ struct video_renderer_s {
 
 static GstFlowReturn video_renderer_recording_new_sample(GstAppSink *sink,
                                                          gpointer user_data) {
-    video_renderer_t *sample_renderer = user_data;
     GstSample *sample;
 
-    g_assert(sample_renderer != NULL);
+    (void)user_data;
     sample = gst_app_sink_pull_sample(sink);
     if (!sample) {
         return GST_FLOW_EOS;
@@ -499,7 +498,7 @@ int video_renderer_init(logger_t *render_logger, const char *server_name, videof
                     renderer_type[i]->recording_sink,
                     "new-sample",
                     G_CALLBACK(video_renderer_recording_new_sample),
-                    renderer_type[i]);
+                    NULL);
             }
             g_string_free(launch, TRUE);
             gst_caps_unref(caps);
@@ -806,11 +805,6 @@ void video_renderer_set_track_metadata(const char *title, const char *artist, co
 static void video_renderer_destroy_instance(video_renderer_t *renderer) {
     if (renderer) {
         logger_log(logger, LOGGER_DEBUG,"destroying renderer instance %p codec=%s ", renderer, renderer->codec);
-        if (renderer->recording_sink && renderer->recording_sample_handler) {
-            g_signal_handler_disconnect(renderer->recording_sink,
-                                        renderer->recording_sample_handler);
-            renderer->recording_sample_handler = 0;
-        }
         if (renderer->pipeline) {
             GstState state;
             GstStateChangeReturn ret;
@@ -820,18 +814,25 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
                 if (!hls_video && renderer->appsrc) {
                     gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
                 }
-                ret = gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
-                logger_log(logger, LOGGER_DEBUG,"pipeline_state_change_return: %s",
-                           gst_element_state_change_return_get_name(ret));
-                gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
-                logger_log(logger, LOGGER_DEBUG,"pipeline state is %s", gst_element_state_get_name(state));
             }
-            gst_object_unref(renderer->bus);
-            gst_object_unref(renderer->pipeline);
+            ret = gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
+            logger_log(logger, LOGGER_DEBUG,"pipeline_state_change_return: %s",
+                       gst_element_state_change_return_get_name(ret));
+            gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
+            logger_log(logger, LOGGER_DEBUG,"pipeline state is %s", gst_element_state_get_name(state));
+        }
+        if (renderer->recording_sink && renderer->recording_sample_handler) {
+            g_signal_handler_disconnect(renderer->recording_sink,
+                                        renderer->recording_sample_handler);
+            renderer->recording_sample_handler = 0;
         }
         if (renderer->recording_sink) {
             gst_object_unref(renderer->recording_sink);
             renderer->recording_sink = NULL;
+        }
+        if (renderer->bus) {
+            gst_object_unref(renderer->bus);
+            renderer->bus = NULL;
         }
         if (renderer->appsrc) {
             gst_object_unref (renderer->appsrc);
@@ -840,6 +841,10 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
         if (renderer->textsrc) {
             gst_object_unref (renderer->textsrc);
             renderer->textsrc = NULL;
+        }
+        if (renderer->pipeline) {
+            gst_object_unref(renderer->pipeline);
+            renderer->pipeline = NULL;
         }
 #ifdef X_DISPLAY_FIX
         if (renderer->gst_window){

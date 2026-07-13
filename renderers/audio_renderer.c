@@ -72,13 +72,15 @@ typedef struct audio_renderer_s {
 static audio_renderer_t *renderer_type[NFORMATS_MAX];
 static audio_renderer_t *renderer = NULL;
 
+void *audio_renderer_get_pipeline(void) {
+    return renderer ? renderer->pipeline : NULL;
+}
+
 static GstFlowReturn audio_renderer_recording_new_sample(GstAppSink *sink,
                                                           gpointer user_data) {
-    audio_renderer_t *audio_renderer = user_data;
     GstSample *sample;
 
-    g_assert(audio_renderer != NULL);
-    g_assert(audio_renderer->recording_sink == GST_ELEMENT(sink));
+    (void)user_data;
     sample = gst_app_sink_pull_sample(sink);
     if (!sample) {
         return GST_FLOW_EOS;
@@ -305,7 +307,7 @@ int audio_renderer_init(logger_t *render_logger, const char* audiosink, const bo
                 renderer_type[i]->recording_sink,
                 "new-sample",
                 G_CALLBACK(audio_renderer_recording_new_sample),
-                renderer_type[i]);
+                NULL);
         }
         gst_caps_unref(caps);
     }
@@ -459,6 +461,16 @@ void audio_renderer_flush() {
 void audio_renderer_destroy() {
     audio_renderer_stop();
     for (int i = 0; i < n_formats ; i++ ) {
+        if (!renderer_type[i]) {
+            continue;
+        }
+        if (renderer_type[i]->pipeline) {
+            gst_element_set_state(renderer_type[i]->pipeline, GST_STATE_NULL);
+            gst_element_get_state(renderer_type[i]->pipeline,
+                                  NULL,
+                                  NULL,
+                                  1000 * GST_MSECOND);
+        }
         if (renderer_type[i]->recording_sample_handler) {
             g_signal_handler_disconnect(renderer_type[i]->recording_sink,
                                         renderer_type[i]->recording_sample_handler);
@@ -468,14 +480,22 @@ void audio_renderer_destroy() {
             gst_object_unref(renderer_type[i]->recording_sink);
             renderer_type[i]->recording_sink = NULL;
         }
-        gst_object_unref (renderer_type[i]->bus);
-        renderer_type[i]->bus = NULL;
-        gst_object_unref (renderer_type[i]->volume);
-        renderer_type[i]->volume = NULL;
-        gst_object_unref (renderer_type[i]->appsrc);
-        renderer_type[i]->appsrc = NULL;
-        gst_object_unref (renderer_type[i]->pipeline);
-        renderer_type[i]->pipeline = NULL;
+        if (renderer_type[i]->bus) {
+            gst_object_unref(renderer_type[i]->bus);
+            renderer_type[i]->bus = NULL;
+        }
+        if (renderer_type[i]->appsrc) {
+            gst_object_unref(renderer_type[i]->appsrc);
+            renderer_type[i]->appsrc = NULL;
+        }
+        if (renderer_type[i]->volume) {
+            gst_object_unref(renderer_type[i]->volume);
+            renderer_type[i]->volume = NULL;
+        }
+        if (renderer_type[i]->pipeline) {
+            gst_object_unref(renderer_type[i]->pipeline);
+            renderer_type[i]->pipeline = NULL;
+        }
         free(renderer_type[i]);
         renderer_type[i] = NULL;
     }

@@ -57,6 +57,8 @@ void audio_renderer_flush();
 void audio_renderer_destroy();
 unsigned int audio_renderer_listen(void *loop, int id);
 void audio_renderer_set_sample_callback(renderer_sample_callback_t callback, void *context);
+/* Returns the active renderer pipeline as a borrowed pointer, or NULL. */
+void *audio_renderer_get_pipeline(void);
 #ifdef __cplusplus
 }
 #endif
