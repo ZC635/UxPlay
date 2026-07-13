@@ -22,16 +22,18 @@
 
 #include <math.h>
 #include <gst/gst.h>
+#include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include "audio_renderer.h"
 #include "sample_tap.h"
 #define SECOND_IN_NSECS 1000000000UL
 
-#define NFORMATS 2     /* set to 4 to enable AAC_LD and PCM:  allowed, but  never seen in real-world use */
+#define NFORMATS_MAX 4
 
 static GstClockTime gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
 static logger_t *logger = NULL;
-const char * format[NFORMATS];
+const char * format[NFORMATS_MAX];
+static const unsigned char compression_types[NFORMATS_MAX] = {8, 2, 4, 1};
 
 static const gchar *avdec_aac = "avdec_aac";
 static const gchar *avdec_alac = "avdec_alac";
@@ -42,6 +44,7 @@ static gboolean async = FALSE;
 static gboolean vsync = FALSE;
 static gboolean sync = FALSE;
 static gboolean audio_rtp = FALSE;
+static int n_formats = 2;
 static sample_tap_t audio_sample_tap;
 static gsize audio_sample_tap_initialized = 0;
 
@@ -61,11 +64,29 @@ typedef struct audio_renderer_s {
     GstElement *appsrc; 
     GstElement *pipeline;
     GstElement *volume;
+    GstElement *recording_sink;
+    gulong recording_sample_handler;
     GstBus *bus;
     unsigned char ct;
 } audio_renderer_t ;
-static audio_renderer_t *renderer_type[NFORMATS];
+static audio_renderer_t *renderer_type[NFORMATS_MAX];
 static audio_renderer_t *renderer = NULL;
+
+static GstFlowReturn audio_renderer_recording_new_sample(GstAppSink *sink,
+                                                          gpointer user_data) {
+    audio_renderer_t *audio_renderer = user_data;
+    GstSample *sample;
+
+    g_assert(audio_renderer != NULL);
+    g_assert(audio_renderer->recording_sink == GST_ELEMENT(sink));
+    sample = gst_app_sink_pull_sample(sink);
+    if (!sample) {
+        return GST_FLOW_EOS;
+    }
+    sample_tap_emit(audio_renderer_get_sample_tap(), sample);
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
 
 /* GStreamer Caps strings for Airplay-defined audio compression types (ct) */
 
@@ -152,11 +173,13 @@ int audio_renderer_init(logger_t *render_logger, const char* audiosink, const bo
     }
 
     logger = render_logger;
+    gboolean tap_enabled = sample_tap_is_enabled(audio_renderer_get_sample_tap());
+    n_formats = tap_enabled ? NFORMATS_MAX : 2;
     
     aac = check_plugin_feature (avdec_aac);
     alac = check_plugin_feature (avdec_alac);
 
-    for (int i = 0; i < NFORMATS ; i++) {
+    for (int i = 0; i < n_formats ; i++) {
         renderer_type[i] = (audio_renderer_t *)  calloc(1,sizeof(audio_renderer_t));
         g_assert(renderer_type[i]);
         GString *launch = g_string_new("appsrc name=audio_source ! ");
@@ -174,9 +197,18 @@ int audio_renderer_init(logger_t *render_logger, const char* audiosink, const bo
         default:
             break;
         }
-        g_string_append (launch, "audioconvert ! ");
-        g_string_append (launch, "audioresample ! ");    /* wasapisink must resample from 44.1 kHz to 48 kHz */
-        g_string_append (launch, "volume name=volume ! ");
+        if (tap_enabled) {
+            g_string_append_printf(launch,
+                                   "audioconvert ! tee name=audio_raw_tee_%u "
+                                   "audio_raw_tee_%u. ! queue ! audioresample ! "
+                                   "volume name=volume ! ",
+                                   compression_types[i],
+                                   compression_types[i]);
+        } else {
+            g_string_append (launch, "audioconvert ! ");
+            g_string_append (launch, "audioresample ! ");    /* wasapisink must resample from 44.1 kHz to 48 kHz */
+            g_string_append (launch, "volume name=volume ! ");
+        }
 
         if (!audio_rtp) {
             /* Normal path: local audio output */
@@ -209,6 +241,19 @@ int audio_renderer_init(logger_t *render_logger, const char* audiosink, const bo
             g_string_append (launch, "rtpL16pay ");
             g_string_append (launch, artp_pipeline);
         }
+        if (tap_enabled) {
+            guint compression_type = compression_types[i];
+            g_string_append_printf(
+                launch,
+                " audio_raw_tee_%u. ! queue name=recording_audio_queue_%u "
+                "leaky=downstream max-size-buffers=8 ! audioconvert ! audioresample ! "
+                "audio/x-raw,format=S16LE,rate=44100,channels=2,layout=interleaved ! "
+                "appsink name=recording_audio_sink_%u emit-signals=true "
+                "max-buffers=8 drop=true sync=false",
+                compression_type,
+                compression_type,
+                compression_type);
+        }
         renderer_type[i]->pipeline  = gst_parse_launch(launch->str, &error);
         if (error) {
             logger_log(logger, LOGGER_ERR, "gst_parse_launch error (audio %d):\n %s\n", i+1, error->message);
@@ -224,25 +269,22 @@ int audio_renderer_init(logger_t *render_logger, const char* audiosink, const bo
         if (!renderer_type[i]->volume) {
             return -1;
         }
+        renderer_type[i]->ct = compression_types[i];
         switch (i) {
         case 0:
             caps =  gst_caps_from_string(aac_eld_caps);
-            renderer_type[i]->ct = 8;
             format[i] = "AAC-ELD 44100/2";
             break;
         case 1:
             caps =  gst_caps_from_string(alac_caps);
-            renderer_type[i]->ct = 2;
             format[i] = "ALAC 44100/16/2";
             break;
         case 2:
             caps =  gst_caps_from_string(aac_lc_caps);
-            renderer_type[i]->ct = 4;
             format[i] = "AAC-LC 44100/2";
             break;
         case 3:
             caps =  gst_caps_from_string(lpcm_caps);
-            renderer_type[i]->ct = 1;
             format[i] = "PCM 44100/16/2 S16LE";
             break;
         default:
@@ -252,9 +294,22 @@ int audio_renderer_init(logger_t *render_logger, const char* audiosink, const bo
         logger_log(logger, LOGGER_DEBUG, "GStreamer audio pipeline %d: \"%s\"", i+1, launch->str);
         g_string_free(launch, TRUE);
         g_object_set(renderer_type[i]->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+        if (tap_enabled) {
+            gchar *recording_sink_name = g_strdup_printf("recording_audio_sink_%u",
+                                                          renderer_type[i]->ct);
+            renderer_type[i]->recording_sink = gst_bin_get_by_name(
+                GST_BIN(renderer_type[i]->pipeline), recording_sink_name);
+            g_free(recording_sink_name);
+            g_assert(renderer_type[i]->recording_sink != NULL);
+            renderer_type[i]->recording_sample_handler = g_signal_connect(
+                renderer_type[i]->recording_sink,
+                "new-sample",
+                G_CALLBACK(audio_renderer_recording_new_sample),
+                renderer_type[i]);
+        }
         gst_caps_unref(caps);
-        g_object_unref(clock);
     }
+    g_object_unref(clock);
     return 0;
 }
 
@@ -269,7 +324,7 @@ void audio_renderer_stop() {
 static void get_renderer_type(unsigned char *ct, int *id) {
     render_audio = FALSE;
     *id = -1;
-    for (int i = 0; i < NFORMATS; i++) {
+    for (int i = 0; i < n_formats; i++) {
         if (renderer_type[i]->ct == *ct) {
 	    *id = i;
             break;
@@ -352,9 +407,7 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
     buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
     g_assert(buffer != NULL);
     //g_print("audio latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
-    if (sync) {
-        GST_BUFFER_PTS(buffer) = pts;
-    }
+    GST_BUFFER_PTS(buffer) = pts;
     gst_buffer_fill(buffer, 0, data, *data_len);
     bool valid = false;
     switch (renderer->ct){
@@ -405,7 +458,16 @@ void audio_renderer_flush() {
 
 void audio_renderer_destroy() {
     audio_renderer_stop();
-    for (int i = 0; i < NFORMATS ; i++ ) {
+    for (int i = 0; i < n_formats ; i++ ) {
+        if (renderer_type[i]->recording_sample_handler) {
+            g_signal_handler_disconnect(renderer_type[i]->recording_sink,
+                                        renderer_type[i]->recording_sample_handler);
+            renderer_type[i]->recording_sample_handler = 0;
+        }
+        if (renderer_type[i]->recording_sink) {
+            gst_object_unref(renderer_type[i]->recording_sink);
+            renderer_type[i]->recording_sink = NULL;
+        }
         gst_object_unref (renderer_type[i]->bus);
         renderer_type[i]->bus = NULL;
         gst_object_unref (renderer_type[i]->volume);
@@ -415,6 +477,7 @@ void audio_renderer_destroy() {
         gst_object_unref (renderer_type[i]->pipeline);
         renderer_type[i]->pipeline = NULL;
         free(renderer_type[i]);
+        renderer_type[i] = NULL;
     }
 }
 
@@ -451,7 +514,7 @@ static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *m
 }
 
 unsigned int audio_renderer_listen(void *loop, int id) {
-    g_assert(id >= 0 && id < NFORMATS);
+    g_assert(id >= 0 && id < n_formats);
     return (unsigned int) gst_bus_add_watch(renderer_type[id]->bus,(GstBusFunc)
                                             gstreamer_audio_pipeline_bus_callback, (gpointer) loop); 
 }

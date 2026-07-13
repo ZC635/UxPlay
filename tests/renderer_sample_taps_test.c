@@ -7,14 +7,440 @@
 #include "../renderers/video_renderer.h"
 
 static void borrowed_sample_callback(GstSample *sample, void *context);
+static gboolean have_gst_factory(const gchar *name);
 
 static logger_t *test_logger;
 static guint shape_callback_calls;
+
+typedef struct log_capture_s {
+    GPtrArray *messages;
+} log_capture_t;
 
 static void discard_log_message(void *context, int level, const char *message) {
     (void)context;
     (void)level;
     (void)message;
+}
+
+static void capture_log_message(void *context, int level, const char *message) {
+    log_capture_t *capture = context;
+
+    (void)level;
+    g_ptr_array_add(capture->messages, g_strdup(message));
+}
+
+static GPtrArray *capture_audio_pipeline_logs(gboolean tap_enabled,
+                                              const gchar *audio_sink,
+                                              const gchar *rtp_pipeline) {
+    log_capture_t capture = {g_ptr_array_new_with_free_func(g_free)};
+    bool audio_sync = false;
+    bool video_sync = false;
+
+    logger_set_level(test_logger, LOGGER_DEBUG);
+    logger_set_callback(test_logger, capture_log_message, &capture);
+    audio_renderer_set_sample_callback(tap_enabled ? borrowed_sample_callback : NULL,
+                                       tap_enabled ? &shape_callback_calls : NULL);
+    g_assert_cmpint(audio_renderer_init(test_logger,
+                                        audio_sink,
+                                        &audio_sync,
+                                        &video_sync,
+                                        rtp_pipeline),
+                    ==,
+                    0);
+    audio_renderer_set_sample_callback(NULL, NULL);
+    audio_renderer_destroy();
+    logger_set_callback(test_logger, discard_log_message, NULL);
+    logger_set_level(test_logger, LOGGER_ERR);
+    return capture.messages;
+}
+
+static GPtrArray *only_audio_pipeline_messages(GPtrArray *messages) {
+    GPtrArray *pipelines = g_ptr_array_new_with_free_func(g_free);
+
+    for (guint i = 0; i < messages->len; i++) {
+        const gchar *message = g_ptr_array_index(messages, i);
+        const gchar *prefix = "GStreamer audio pipeline ";
+
+        if (g_str_has_prefix(message, prefix)) {
+            const gchar *launch = strchr(message, '"');
+            gsize length;
+
+            g_assert_nonnull(launch);
+            launch++;
+            length = strlen(launch);
+            g_assert_cmpuint(length, >, 0);
+            g_assert_cmpint(launch[length - 1], ==, '"');
+            g_ptr_array_add(pipelines, g_strndup(launch, length - 1));
+        }
+    }
+    return pipelines;
+}
+
+static void assert_contains_text(const gchar *text, const gchar *needle) {
+    g_assert_nonnull(strstr(text, needle));
+}
+
+static void test_audio_tap_default_off_keeps_original_pipeline(void) {
+    GPtrArray *messages = capture_audio_pipeline_logs(FALSE, "fakesink", "");
+    GPtrArray *pipelines = only_audio_pipeline_messages(messages);
+    const gchar *expected_decoders[2] = {
+        have_gst_factory("avdec_aac") ? "avdec_aac ! " : "",
+        have_gst_factory("avdec_alac") ? "avdec_alac ! " : ""
+    };
+
+    g_assert_cmpuint(pipelines->len, ==, 2);
+    for (guint i = 0; i < pipelines->len; i++) {
+        gchar *expected = g_strdup_printf(
+            "appsrc name=audio_source ! queue ! %saudioconvert ! "
+            "audioresample ! volume name=volume ! level ! fakesink sync=false",
+            expected_decoders[i]);
+        const gchar *launch = g_ptr_array_index(pipelines, i);
+
+        g_assert_cmpstr(launch, ==, expected);
+        g_assert_null(strstr(launch, "audio_raw_tee"));
+        g_assert_null(strstr(launch, "recording_audio_sink"));
+        g_free(expected);
+    }
+    g_ptr_array_unref(pipelines);
+    g_ptr_array_unref(messages);
+}
+
+static void assert_recording_audio_shape(const gchar *launch,
+                                         guint compression_type,
+                                         const gchar *decoder) {
+    gchar *prefix = g_strdup_printf(
+        "appsrc name=audio_source ! queue ! %saudioconvert ! "
+        "tee name=audio_raw_tee_%u ",
+        decoder,
+        compression_type);
+    gchar *record_branch = g_strdup_printf(
+        "audio_raw_tee_%u. ! queue name=recording_audio_queue_%u "
+        "leaky=downstream max-size-buffers=8 ! audioconvert ! audioresample ! "
+        "audio/x-raw,format=S16LE,rate=44100,channels=2,layout=interleaved ! "
+        "appsink name=recording_audio_sink_%u emit-signals=true "
+        "max-buffers=8 drop=true sync=false",
+        compression_type,
+        compression_type,
+        compression_type);
+    gchar *playback_branch = g_strdup_printf(
+        "audio_raw_tee_%u. ! queue ! audioresample ! volume name=volume ! ",
+        compression_type);
+
+    g_assert_true(g_str_has_prefix(launch, prefix));
+    assert_contains_text(launch, playback_branch);
+    assert_contains_text(launch, record_branch);
+    g_free(playback_branch);
+    g_free(record_branch);
+    g_free(prefix);
+}
+
+static gboolean messages_contain(GPtrArray *messages, const gchar *needle) {
+    for (guint i = 0; i < messages->len; i++) {
+        if (strstr(g_ptr_array_index(messages, i), needle)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static void test_audio_tap_can_start_every_supported_renderer(void) {
+    const guint8 compression_types[] = {8, 2, 4, 1};
+    const gchar *formats[] = {
+        "AAC-ELD 44100/2",
+        "ALAC 44100/16/2",
+        "AAC-LC 44100/2",
+        "PCM 44100/16/2 S16LE"
+    };
+    log_capture_t capture = {g_ptr_array_new_with_free_func(g_free)};
+    bool audio_sync = false;
+    bool video_sync = false;
+
+    logger_set_level(test_logger, LOGGER_DEBUG);
+    logger_set_callback(test_logger, capture_log_message, &capture);
+    audio_renderer_set_sample_callback(borrowed_sample_callback,
+                                       &shape_callback_calls);
+    g_assert_cmpint(audio_renderer_init(test_logger,
+                                        "fakesink",
+                                        &audio_sync,
+                                        &video_sync,
+                                        ""),
+                    ==,
+                    0);
+    for (guint i = 0; i < G_N_ELEMENTS(compression_types); i++) {
+        guint8 compression_type = compression_types[i];
+        audio_renderer_start(&compression_type);
+    }
+    audio_renderer_set_sample_callback(NULL, NULL);
+    audio_renderer_stop();
+    audio_renderer_destroy();
+    logger_set_callback(test_logger, discard_log_message, NULL);
+    logger_set_level(test_logger, LOGGER_ERR);
+
+    g_assert_false(messages_contain(capture.messages,
+                                    "unknown audio compression type"));
+    for (guint i = 0; i < G_N_ELEMENTS(formats); i++) {
+        g_assert_true(messages_contain(capture.messages, formats[i]));
+    }
+    g_ptr_array_unref(capture.messages);
+}
+
+static void test_audio_tap_builds_all_supported_renderers(void) {
+    const guint compression_types[] = {8, 2, 4, 1};
+    const gchar *decoders[] = {
+        have_gst_factory("avdec_aac") ? "avdec_aac ! " : "",
+        have_gst_factory("avdec_alac") ? "avdec_alac ! " : "",
+        have_gst_factory("avdec_aac") ? "avdec_aac ! " : "",
+        ""
+    };
+    GPtrArray *messages = capture_audio_pipeline_logs(TRUE, "fakesink", "");
+    GPtrArray *pipelines = only_audio_pipeline_messages(messages);
+
+    g_assert_cmpuint(pipelines->len, ==, G_N_ELEMENTS(compression_types));
+    for (guint i = 0; i < pipelines->len; i++) {
+        assert_recording_audio_shape(g_ptr_array_index(pipelines, i),
+                                     compression_types[i],
+                                     decoders[i]);
+    }
+    g_ptr_array_unref(pipelines);
+    g_ptr_array_unref(messages);
+}
+
+static void test_audio_tap_rtp_pipeline_has_recording_branch(void) {
+    GPtrArray *messages = capture_audio_pipeline_logs(
+        TRUE,
+        "fakesink",
+        "! application/x-rtp ! fakesink sync=false");
+    GPtrArray *pipelines = only_audio_pipeline_messages(messages);
+
+    g_assert_cmpuint(pipelines->len, ==, 4);
+    for (guint i = 0; i < pipelines->len; i++) {
+        const gchar *launch = g_ptr_array_index(pipelines, i);
+        assert_contains_text(launch, "audio/x-raw,format=S16BE,rate=44100,channels=2");
+        assert_contains_text(launch, "recording_audio_sink_");
+    }
+    g_ptr_array_unref(pipelines);
+    g_ptr_array_unref(messages);
+}
+
+typedef struct audio_capture_s {
+    GMutex mutex;
+    GCond changed;
+    guint calls;
+    gboolean caps_ok;
+    gboolean payload_nonzero;
+    GstClockTime pts[3];
+    guint phase;
+    guint calls_by_phase[2];
+} audio_capture_t;
+
+static void capture_audio_sample(GstSample *sample, void *context) {
+    audio_capture_t *capture = context;
+    GstCaps *caps = gst_sample_get_caps(sample);
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    const GstStructure *structure = caps ? gst_caps_get_structure(caps, 0) : NULL;
+    const gchar *format = structure ? gst_structure_get_string(structure, "format") : NULL;
+    const gchar *layout = structure ? gst_structure_get_string(structure, "layout") : NULL;
+    gint rate = 0;
+    gint channels = 0;
+    gboolean caps_ok = structure &&
+        gst_structure_has_name(structure, "audio/x-raw") &&
+        g_strcmp0(format, "S16LE") == 0 &&
+        g_strcmp0(layout, "interleaved") == 0 &&
+        gst_structure_get_int(structure, "rate", &rate) && rate == 44100 &&
+        gst_structure_get_int(structure, "channels", &channels) && channels == 2;
+    gboolean payload_nonzero = FALSE;
+
+    if (buffer) {
+        GstMapInfo map;
+        if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+            for (gsize i = 0; i < map.size; i++) {
+                if (map.data[i] != 0) {
+                    payload_nonzero = TRUE;
+                    break;
+                }
+            }
+            gst_buffer_unmap(buffer, &map);
+        }
+    }
+
+    g_mutex_lock(&capture->mutex);
+    capture->caps_ok &= caps_ok;
+    capture->payload_nonzero |= payload_nonzero;
+    if (capture->calls < G_N_ELEMENTS(capture->pts)) {
+        capture->pts[capture->calls] = buffer ? GST_BUFFER_PTS(buffer)
+                                             : GST_CLOCK_TIME_NONE;
+    }
+    if (capture->phase < G_N_ELEMENTS(capture->calls_by_phase)) {
+        capture->calls_by_phase[capture->phase]++;
+    }
+    capture->calls++;
+    g_cond_broadcast(&capture->changed);
+    g_mutex_unlock(&capture->mutex);
+}
+
+static gboolean wait_for_unexpected_audio_sample(audio_capture_t *capture,
+                                                  guint baseline) {
+    gint64 deadline = g_get_monotonic_time() +
+                      (500 * G_TIME_SPAN_MILLISECOND);
+    gboolean changed;
+
+    g_mutex_lock(&capture->mutex);
+    while (capture->calls == baseline &&
+           g_cond_wait_until(&capture->changed, &capture->mutex, deadline)) {
+    }
+    changed = capture->calls != baseline;
+    g_mutex_unlock(&capture->mutex);
+    return changed;
+}
+
+static gboolean wait_for_audio_samples(audio_capture_t *capture, guint expected) {
+    gint64 deadline = g_get_monotonic_time() + (5 * G_TIME_SPAN_SECOND);
+    gboolean complete;
+
+    g_mutex_lock(&capture->mutex);
+    while (capture->calls < expected &&
+           g_cond_wait_until(&capture->changed, &capture->mutex, deadline)) {
+    }
+    complete = capture->calls >= expected;
+    g_mutex_unlock(&capture->mutex);
+    return complete;
+}
+
+static void test_audio_tap_pcm_is_pre_volume_s16le_with_monotonic_pts(void) {
+    audio_capture_t capture = {0};
+    bool audio_sync = false;
+    bool video_sync = false;
+    guint8 compression_type = 1;
+    gint16 pcm[441 * 2];
+
+    if (!have_gst_factory("appsink") ||
+        !have_gst_factory("audioconvert") ||
+        !have_gst_factory("audioresample") ||
+        !have_gst_factory("fakesink")) {
+        g_test_skip("raw audio test plugins are unavailable");
+        return;
+    }
+    for (guint i = 0; i < G_N_ELEMENTS(pcm); i++) {
+        pcm[i] = (i % 2 == 0) ? 0x1234 : -0x2345;
+    }
+    g_mutex_init(&capture.mutex);
+    g_cond_init(&capture.changed);
+    capture.caps_ok = TRUE;
+    audio_renderer_set_sample_callback(capture_audio_sample, &capture);
+    g_assert_cmpint(audio_renderer_init(test_logger,
+                                        "fakesink",
+                                        &audio_sync,
+                                        &video_sync,
+                                        ""),
+                    ==,
+                    0);
+    audio_renderer_start(&compression_type);
+    audio_renderer_set_volume(0.0);
+
+    for (guint i = 0; i < G_N_ELEMENTS(capture.pts); i++) {
+        int data_len = sizeof(pcm);
+        unsigned short sequence = (unsigned short)i;
+        uint64_t remote_pts = (10 * GST_SECOND) +
+                              (i * 10 * GST_MSECOND);
+
+        audio_renderer_render_buffer((guint8 *)pcm,
+                                     &data_len,
+                                     &sequence,
+                                     &remote_pts);
+        g_assert_true(wait_for_audio_samples(&capture, i + 1));
+    }
+    audio_renderer_set_sample_callback(NULL, NULL);
+    audio_renderer_destroy();
+
+    g_mutex_lock(&capture.mutex);
+    guint calls = capture.calls;
+    gboolean caps_ok = capture.caps_ok;
+    gboolean payload_nonzero = capture.payload_nonzero;
+    GstClockTime first_pts = capture.pts[0];
+    GstClockTime second_pts = capture.pts[1];
+    GstClockTime third_pts = capture.pts[2];
+    g_mutex_unlock(&capture.mutex);
+    g_cond_clear(&capture.changed);
+    g_mutex_clear(&capture.mutex);
+
+    g_assert_cmpuint(calls, ==, 3);
+    g_assert_true(caps_ok);
+    g_assert_true(payload_nonzero);
+    g_assert_true(GST_CLOCK_TIME_IS_VALID(first_pts));
+    g_assert_true(GST_CLOCK_TIME_IS_VALID(second_pts));
+    g_assert_true(GST_CLOCK_TIME_IS_VALID(third_pts));
+    g_assert_cmpuint(first_pts, ==, 10 * GST_SECOND);
+    g_assert_cmpuint(first_pts, <, second_pts);
+    g_assert_cmpuint(second_pts, <, third_pts);
+}
+
+static void test_only_active_audio_renderer_emits_samples(void) {
+    audio_capture_t capture = {0};
+    log_capture_t logs = {g_ptr_array_new_with_free_func(g_free)};
+    bool audio_sync = false;
+    bool video_sync = false;
+    guint8 pcm_type = 1;
+    guint8 aac_eld_type = 8;
+    guint8 data[441 * 4];
+    int data_len = sizeof(data);
+    unsigned short sequence = 1;
+    uint64_t remote_pts = 20 * GST_SECOND;
+
+    memset(data, 0x34, sizeof(data));
+    data[0] = 0x8c;
+    g_mutex_init(&capture.mutex);
+    g_cond_init(&capture.changed);
+    capture.caps_ok = TRUE;
+    logger_set_level(test_logger, LOGGER_DEBUG);
+    logger_set_callback(test_logger, capture_log_message, &logs);
+    audio_renderer_set_sample_callback(capture_audio_sample, &capture);
+    g_assert_cmpint(audio_renderer_init(test_logger,
+                                        "fakesink",
+                                        &audio_sync,
+                                        &video_sync,
+                                        ""),
+                    ==,
+                    0);
+    audio_renderer_start(&pcm_type);
+    audio_renderer_render_buffer(data,
+                                 &data_len,
+                                 &sequence,
+                                 &remote_pts);
+    g_assert_true(wait_for_audio_samples(&capture, 1));
+
+    g_mutex_lock(&capture.mutex);
+    capture.phase = 1;
+    guint calls_before_switch = capture.calls;
+    g_mutex_unlock(&capture.mutex);
+    audio_renderer_start(&aac_eld_type);
+    data_len = sizeof(data);
+    sequence++;
+    remote_pts += 10 * GST_MSECOND;
+    audio_renderer_render_buffer(data,
+                                 &data_len,
+                                 &sequence,
+                                 &remote_pts);
+    g_assert_false(wait_for_unexpected_audio_sample(&capture,
+                                                    calls_before_switch));
+
+    audio_renderer_set_sample_callback(NULL, NULL);
+    audio_renderer_destroy();
+    logger_set_callback(test_logger, discard_log_message, NULL);
+    logger_set_level(test_logger, LOGGER_ERR);
+
+    g_mutex_lock(&capture.mutex);
+    guint pcm_calls = capture.calls_by_phase[0];
+    guint after_switch_calls = capture.calls_by_phase[1];
+    g_mutex_unlock(&capture.mutex);
+    g_cond_clear(&capture.changed);
+    g_mutex_clear(&capture.mutex);
+
+    g_assert_cmpuint(pcm_calls, ==, 1);
+    g_assert_cmpuint(after_switch_calls, ==, 0);
+    g_assert_true(messages_contain(logs.messages,
+                                   "changed audio connection, format AAC-ELD 44100/2"));
+    g_test_message("AAC-ELD data-level decode skipped: no deterministic valid fixture");
+    g_ptr_array_unref(logs.messages);
 }
 
 typedef struct video_capture_s {
@@ -884,6 +1310,18 @@ int main(int argc, char **argv) {
                     test_video_tap_h264_samples_are_rgba_with_monotonic_pts);
     g_test_add_func("/renderer/video-tap/only-selected-renderer-emits",
                     test_only_selected_video_renderer_emits_samples);
+    g_test_add_func("/renderer/audio-tap/default-off-keeps-original-pipeline",
+                    test_audio_tap_default_off_keeps_original_pipeline);
+    g_test_add_func("/renderer/audio-tap/builds-all-supported-renderers",
+                    test_audio_tap_builds_all_supported_renderers);
+    g_test_add_func("/renderer/audio-tap/starts-all-supported-renderers",
+                    test_audio_tap_can_start_every_supported_renderer);
+    g_test_add_func("/renderer/audio-tap/rtp-has-recording-branch",
+                    test_audio_tap_rtp_pipeline_has_recording_branch);
+    g_test_add_func("/renderer/audio-tap/pcm-pre-volume-s16le-monotonic-pts",
+                    test_audio_tap_pcm_is_pre_volume_s16le_with_monotonic_pts);
+    g_test_add_func("/renderer/audio-tap/only-active-renderer-emits",
+                    test_only_active_audio_renderer_emits_samples);
     g_test_add_func("/renderer/sample-taps/registration-api-compiles",
                     test_registration_api_compiles);
     g_test_add_func("/renderer/sample-taps/disabled-after-init",
