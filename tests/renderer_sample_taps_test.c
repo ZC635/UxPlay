@@ -450,6 +450,9 @@ typedef struct slow_audio_state_s {
     GCond changed;
     guint playback_calls;
     guint tap_calls;
+    gboolean tap_waiting;
+    gboolean release_tap;
+    gboolean tap_wait_timed_out;
 } slow_audio_state_t;
 
 static void slow_audio_tap_callback(GstSample *sample, void *context) {
@@ -458,7 +461,14 @@ static void slow_audio_tap_callback(GstSample *sample, void *context) {
     g_assert_nonnull(sample);
     g_mutex_lock(&state->mutex);
     state->tap_calls++;
+    state->tap_waiting = TRUE;
     g_cond_broadcast(&state->changed);
+    gint64 deadline = g_get_monotonic_time() + (5 * G_TIME_SPAN_SECOND);
+    while (!state->release_tap &&
+           g_cond_wait_until(&state->changed, &state->mutex, deadline)) {
+    }
+    state->tap_wait_timed_out = state->tap_wait_timed_out || !state->release_tap;
+    state->tap_waiting = FALSE;
     g_mutex_unlock(&state->mutex);
     g_usleep(250 * G_TIME_SPAN_MILLISECOND);
 }
@@ -476,6 +486,19 @@ static void playback_fakesink_handoff(GstElement *sink,
     state->playback_calls++;
     g_cond_broadcast(&state->changed);
     g_mutex_unlock(&state->mutex);
+}
+
+static gboolean wait_for_slow_audio_tap(slow_audio_state_t *state,
+                                        gint64 deadline) {
+    gboolean entered;
+
+    g_mutex_lock(&state->mutex);
+    while (!state->tap_waiting &&
+           g_cond_wait_until(&state->changed, &state->mutex, deadline)) {
+    }
+    entered = state->tap_waiting;
+    g_mutex_unlock(&state->mutex);
+    return entered;
 }
 
 static gboolean wait_for_playback_buffers(slow_audio_state_t *state,
@@ -550,8 +573,19 @@ static void test_slow_audio_tap_does_not_block_playback_pushes(void) {
     g_assert_true(sink_drop);
     g_assert_false(sink_sync);
 
+    /* The first of the same 100 buffers starts the slow consumer. Its
+     * participation wait is included in the original 500 ms push budget. */
     gint64 push_started = g_get_monotonic_time();
-    for (guint i = 0; i < 100; i++) {
+    int first_data_len = sizeof(pcm);
+    unsigned short first_sequence = 0;
+    uint64_t first_pts = 30 * GST_SECOND;
+    audio_renderer_render_buffer((guint8 *)pcm,
+                                 &first_data_len,
+                                 &first_sequence,
+                                 &first_pts);
+    gboolean tap_entered = wait_for_slow_audio_tap(
+        &state, push_started + (500 * G_TIME_SPAN_MILLISECOND));
+    for (guint i = 1; i < 100; i++) {
         int data_len = sizeof(pcm);
         unsigned short sequence = (unsigned short)i;
         uint64_t remote_pts = (30 * GST_SECOND) + (i * 10 * GST_MSECOND);
@@ -563,12 +597,18 @@ static void test_slow_audio_tap_does_not_block_playback_pushes(void) {
     gint64 push_elapsed = g_get_monotonic_time() - push_started;
     gboolean playback_complete = wait_for_playback_buffers(&state, 100);
 
+    g_mutex_lock(&state.mutex);
+    gboolean tap_blocked_during_playback = state.tap_waiting;
+    state.release_tap = TRUE;
+    g_cond_broadcast(&state.changed);
+    g_mutex_unlock(&state.mutex);
     audio_renderer_set_sample_callback(NULL, NULL);
     g_signal_handler_disconnect(playback_sink, handoff_handler);
     audio_renderer_destroy();
     g_mutex_lock(&state.mutex);
     guint playback_calls = state.playback_calls;
     guint tap_calls = state.tap_calls;
+    gboolean tap_wait_timed_out = state.tap_wait_timed_out;
     g_mutex_unlock(&state.mutex);
     gst_object_unref(recording_sink);
     gst_object_unref(recording_queue);
@@ -580,6 +620,10 @@ static void test_slow_audio_tap_does_not_block_playback_pushes(void) {
                    push_elapsed / 1000.0,
                    playback_calls,
                    tap_calls);
+    g_assert_true(tap_entered);
+    g_assert_true(tap_blocked_during_playback);
+    g_assert_false(tap_wait_timed_out);
+    g_assert_cmpuint(tap_calls, >, 0);
     g_assert_cmpint(push_elapsed, <, 500 * G_TIME_SPAN_MILLISECOND);
     g_assert_true(playback_complete);
     g_assert_cmpuint(playback_calls, ==, 100);
