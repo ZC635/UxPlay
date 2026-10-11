@@ -383,7 +383,10 @@ int video_renderer_init(logger_t *render_logger, const char *server_name, videof
                 }
             }
             if (!rtp || jpeg_pipeline) {
-                g_string_append(launch, " ! ");
+                /* decodebin removes its dynamic output pad on stop. Keep the
+                 * delayed link installed so a reused pipeline links the new pad
+                 * on every connection, rather than only the first one. */
+                g_string_append(launch, jpeg_pipeline ? " ! " : " : ");
                 append_videoflip(launch, &videoflip[0], &videoflip[1]);
                 g_string_append(launch, converter);
                 bool raw_tap_enabled = !jpeg_pipeline && !rtp &&
