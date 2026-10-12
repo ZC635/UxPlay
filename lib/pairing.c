@@ -554,7 +554,12 @@ srp_new_user(pairing_session_t *session, pairing_t *pairing, const char *device_
 
 int
 srp_validate_proof(pairing_session_t *session, pairing_t *pairing, const unsigned char *A,
-                    int len_A, unsigned char *proof, int client_proof_len, int proof_len) {
+                   int len_A, unsigned char *proof, int proof_len) {
+    if (!session || !session->srp || !A || len_A <= 0 || len_A > SRP_PK_SIZE ||
+        !proof || proof_len != SRP_PROOF_SIZE) {
+        return -1;
+    }
+
     int authenticated  = 0;
     const unsigned char *B =  NULL;
     const unsigned char *b = session->srp->private_key;
@@ -570,6 +575,9 @@ srp_validate_proof(pairing_session_t *session, pairing_t *pairing, const unsigne
                                                     A, len_A,
                                                     b, len_b,
                                                     &B, &len_B, NULL, NULL, 1);
+    if (!verifier) {
+        return -1;
+    }
 
     srp_verifier_verify_session(verifier, proof, &M2);
     authenticated = srp_verifier_is_authenticated(verifier);
@@ -581,11 +589,12 @@ srp_validate_proof(pairing_session_t *session, pairing_t *pairing, const unsigne
         return -1;
     }
     session_key = srp_verifier_get_session_key(verifier, &len_K);
-    if (len_K != SRP_SESSION_KEY_SIZE) {
+    if (len_K != SRP_SESSION_KEY_SIZE || !session_key || !M2) {
+        srp_verifier_delete(verifier);
         return -2;
     }
     memcpy(session->srp->session_key, session_key, len_K);
-    memcpy(proof, M2, proof_len);
+    memcpy(proof, M2, SRP_M2_SIZE);
     srp_verifier_delete(verifier);
     return 0;
 }

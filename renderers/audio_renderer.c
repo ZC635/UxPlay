@@ -59,6 +59,7 @@ static sample_tap_t *audio_renderer_get_sample_tap(void) {
 void audio_renderer_set_sample_callback(renderer_sample_callback_t callback, void *context) {
     sample_tap_set(audio_renderer_get_sample_tap(), callback, context);
 }
+static gdouble volume_level = 1.0;
 
 typedef struct audio_renderer_s {
     GstElement *appsrc; 
@@ -96,14 +97,14 @@ static GstFlowReturn audio_renderer_recording_new_sample(GstAppSink *sink,
 static const char lpcm_caps[]="audio/x-raw,rate=(int)44100,channels=(int)2,format=S16LE,layout=interleaved";
 
 /* ct = 2; codec_data is ALAC magic cookie:  44100/16/2 spf = 352 */    
-static const char alac_caps[] = "audio/x-alac,mpegversion=(int)4,channnels=(int)2,rate=(int)44100,stream-format=raw,codec_data=(buffer)"
+static const char alac_caps[] = "audio/x-alac,mpegversion=(int)4,channels=(int)2,rate=(int)44100,stream-format=raw,codec_data=(buffer)"
                            "00000024""616c6163""00000000""00000160""0010280a""0e0200ff""00000000""00000000""0000ac44";
 
 /* ct = 4; codec_data from MPEG v4 ISO 14996-3 Section 1.6.2.1:  AAC-LC 44100/2 spf = 1024 */
-static const char aac_lc_caps[] ="audio/mpeg,mpegversion=(int)4,channnels=(int)2,rate=(int)44100,stream-format=raw,codec_data=(buffer)1210";
+static const char aac_lc_caps[] ="audio/mpeg,mpegversion=(int)4,channels=(int)2,rate=(int)44100,stream-format=raw,codec_data=(buffer)1210";
 
 /* ct = 8; codec_data from MPEG v4 ISO 14996-3 Section 1.6.2.1: AAC_ELD 44100/2  spf = 480 */
-static const char aac_eld_caps[] ="audio/mpeg,mpegversion=(int)4,channnels=(int)2,rate=(int)44100,stream-format=raw,codec_data=(buffer)f8e85000";
+static const char aac_eld_caps[] ="audio/mpeg,mpegversion=(int)4,channels=(int)2,rate=(int)44100,stream-format=raw,codec_data=(buffer)f8e85000";
 
 static gboolean check_plugins (void)
 {
@@ -202,13 +203,13 @@ int audio_renderer_init(logger_t *render_logger, const char* audiosink, const bo
         if (tap_enabled) {
             g_string_append_printf(launch,
                                    "audioconvert ! tee name=audio_raw_tee_%u "
-                                   "audio_raw_tee_%u. ! queue ! audioresample ! "
+                                   "audio_raw_tee_%u. ! queue ! audioresample quality=10 ! "
                                    "volume name=volume ! ",
                                    compression_types[i],
                                    compression_types[i]);
         } else {
             g_string_append (launch, "audioconvert ! ");
-            g_string_append (launch, "audioresample ! ");    /* wasapisink must resample from 44.1 kHz to 48 kHz */
+            g_string_append (launch, "audioresample quality=10 ! ");    /* wasapisink must resample from 44.1 kHz to 48 kHz */
             g_string_append (launch, "volume name=volume ! ");
         }
 
@@ -272,6 +273,9 @@ int audio_renderer_init(logger_t *render_logger, const char* audiosink, const bo
             return -1;
         }
         renderer_type[i]->ct = compression_types[i];
+        if (renderer_type[i]->volume) {
+            g_object_set(renderer_type[i]->volume, "volume", volume_level, NULL);
+        }
         switch (i) {
         case 0:
             caps =  gst_caps_from_string(aac_eld_caps);
@@ -452,7 +456,12 @@ void audio_renderer_set_volume(double volume) {
     }
     volume = (volume > 10.0) ? 10.0 : volume;
     volume = (volume < 0.0) ? 0.0 : volume;
-    g_object_set(renderer->volume, "volume", volume, NULL);
+    volume_level = (gdouble) volume;
+    for (int i = 0; i < n_formats; i++) {
+        if (renderer_type[i] && renderer_type[i]->volume) {
+            g_object_set(renderer_type[i]->volume, "volume", volume_level, NULL);
+        }
+    }
 }
 
 void audio_renderer_flush() {

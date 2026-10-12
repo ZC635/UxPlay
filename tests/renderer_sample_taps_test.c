@@ -93,7 +93,7 @@ static void test_audio_tap_default_off_keeps_original_pipeline(void) {
     for (guint i = 0; i < pipelines->len; i++) {
         gchar *expected = g_strdup_printf(
             "appsrc name=audio_source ! queue ! %saudioconvert ! "
-            "audioresample ! volume name=volume ! level ! fakesink sync=false",
+            "audioresample quality=10 ! volume name=volume ! level ! fakesink sync=false",
             expected_decoders[i]);
         const gchar *launch = g_ptr_array_index(pipelines, i);
 
@@ -124,7 +124,7 @@ static void assert_recording_audio_shape(const gchar *launch,
         compression_type,
         compression_type);
     gchar *playback_branch = g_strdup_printf(
-        "audio_raw_tee_%u. ! queue ! audioresample ! volume name=volume ! ",
+        "audio_raw_tee_%u. ! queue ! audioresample quality=10 ! volume name=volume ! ",
         compression_type);
 
     g_assert_true(g_str_has_prefix(launch, prefix));

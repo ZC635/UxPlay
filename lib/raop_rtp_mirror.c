@@ -23,17 +23,13 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdbool.h>
-#ifdef _WIN32
-#include <winsock2.h>
-#else
-#include <netinet/tcp.h>
-#endif
 
 #include "raop.h"
 #include "netutils.h"
 #include "compat.h"
 #include "logger.h"
 #include "byteutils.h"
+#include "raop_rtp_mirror_nal.h"
 #include "mirror_buffer.h"
 #include "stream.h"
 #include "utils.h"
@@ -332,8 +328,9 @@ raop_rtp_mirror_thread(void *arg)
                 n -= 3;
                 p += 3;
             }
-            ntp_timestamp_raw = byteutils_get_long(packet, 8);
-            ntp_timestamp_remote = raop_ntp_timestamp_to_nano_seconds(ntp_timestamp_raw, false);
+	    /* include SECONDS_1900_TO_1970 in the offset adjustment */
+            ntp_timestamp_raw = raop_ntp_adjust_remote_timestamp_offset(raop_rtp_mirror->ntp, byteutils_get_long(packet, 8), true);
+            ntp_timestamp_remote = raop_ntp_timestamp_to_nano_seconds(raop_rtp_mirror->ntp, ntp_timestamp_raw);
             if (first_packet) {
 	        uint64_t offset  = raop_ntp_get_local_time() - ntp_timestamp_remote;
                 raop_ntp_set_video_arrival_offset(raop_rtp_mirror->ntp, &offset);
@@ -460,13 +457,13 @@ raop_rtp_mirror_thread(void *arg)
                 int nalu_size = 0;
                 int nalus_count = 0;
                 while (nalu_size < payload_size) {
-                    int nc_len = byteutils_get_int_be(payload_decrypted, nalu_size);
-                    if (nc_len < 0 || nalu_size + 4 > payload_size) {
+                    int nc_len;
+                    if (!raop_rtp_mirror_next_nal(payload_decrypted,
+                                                   payload_size,
+                                                   &nalu_size, &nc_len)) {
                         valid_data = false;
                         break;
                     }
-                    memcpy(payload_decrypted + nalu_size, nal_start_code, 4);
-                    nalu_size += 4;
                     nalus_count++;
                     /* first bit of h264 nalu MUST be 0 ("forbidden_zero_bit") */
                     if (payload_decrypted[nalu_size] & 0x80) {
@@ -805,14 +802,15 @@ raop_rtp_mirror_thread(void *arg)
                         }
                     }
                     if (plist_size) {
-                        char *plist_xml = NULL;
-                        uint32_t plist_len = 0;
-                        plist_t root_node = NULL;
-                        plist_from_bin((char *) payload, plist_size, &root_node);
                         if (raop_rtp_mirror->show_client_FPS_data) {
+                            char *plist_xml = NULL;
+                            uint32_t plist_len = 0;
+                            plist_t root_node = NULL;
+                            plist_from_bin((char *) payload, plist_size, &root_node);
                             plist_to_xml(root_node, &plist_xml, &plist_len);
                             logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "%s", plist_xml);
                             free(plist_xml);
+                            plist_free(root_node);
                         }
                     }
                 }

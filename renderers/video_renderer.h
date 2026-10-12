@@ -94,6 +94,8 @@ void video_renderer_set_force_aspect_ratio(bool enabled);
 bool video_renderer_get_force_aspect_ratio(void);
 void *video_renderer_get_pipeline(void);
 void video_renderer_set_sample_callback(renderer_sample_callback_t callback, void *context);
+void video_renderer_hls_set_volume(double volume);
+bool gstreamer_decoder_check(const char *decoder);
 #ifdef __cplusplus
 }
 #endif
