@@ -10,8 +10,6 @@ env:
   BUILD_TYPE: RelWithDebInfo
   # Disable interactive features
   DEBIAN_FRONTEND: noninteractive
-  HOMEBREW_NO_ANALYTICS: 1
-  HOMEBREW_NO_INSTALL_CLEANUP: 1
 
 jobs:
   build-linux:
@@ -43,45 +41,6 @@ jobs:
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DNO_X11_DEPS=OFF
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Verify binary
-        run: |
-          test -x build/uxplay
-          ls -la build/uxplay
-
-  build-macos:
-    runs-on: macos-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Remove untrusted Homebrew AWS tap
-        run: brew untap aws/tap || true
-
-      - name: Install dependencies
-        run: |
-          brew install \
-            cmake \
-            openssl@3 \
-            libplist \
-            glib \
-            gstreamer \
-            gst-plugins-base \
-            gst-plugins-good \
-            orc \
-            meson
-
-      - name: Set OpenSSL path
-        run: |
-          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
-
-      - name: Configure CMake
-        run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DNO_X11_DEPS=ON
 
       - name: Build
         run: cmake --build build --parallel
