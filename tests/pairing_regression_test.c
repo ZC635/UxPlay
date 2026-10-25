@@ -154,6 +154,21 @@ static void make_client_proof(const char *username, const char *pin,
     BN_free(S); BN_CTX_free(ctx);
 }
 
+static void new_test_user(pairing_session_t *session, pairing_t *pairing,
+                          const char *device_id, const char *pin,
+                          const char **salt, int *salt_len, char **B, int *B_len) {
+    /* Existing SRP rejects randomly generated salt/verifier values whose
+     * big-endian representation has a leading zero byte. Retry only that
+     * documented error, so repeated leak tests are not probabilistic. */
+    for (int attempt = 0; attempt < 16; attempt++) {
+        int result = srp_new_user(session, pairing, device_id, pin, salt, salt_len, B, B_len);
+        if (result == 0) return;
+        assert(result == -3);
+        assert(*B == NULL && *B_len == 0);
+    }
+    assert(!"repeated short SRP salt/verifier generation");
+}
+
 static void test_malformed_proof_lengths_are_rejected(void) {
     static const int invalid_lengths[] = {0, 1, 19, 21, 64};
 
@@ -164,7 +179,7 @@ static void test_malformed_proof_lengths_are_rejected(void) {
         pairing_t *pairing = pairing_init_generate(device_id, "", &result);
         pairing_session_t *session = pairing_session_init(pairing);
         const char *salt = NULL;
-        const char *B = NULL;
+        char *B = NULL;
         int salt_len = 0;
         int B_len = 0;
         unsigned char *A = NULL;
@@ -174,8 +189,7 @@ static void test_malformed_proof_lengths_are_rejected(void) {
         assert(pairing != NULL);
         assert(result == 0);
         assert(session != NULL);
-        assert(srp_new_user(session, pairing, device_id, pin,
-                            &salt, &salt_len, &B, &B_len) == 0);
+        new_test_user(session, pairing, device_id, pin, &salt, &salt_len, &B, &B_len);
         make_client_proof(device_id, pin, (const unsigned char *)salt, salt_len,
                           (const unsigned char *)B, B_len, &A, &len_A, proof);
         memcpy(proof + TEST_PROOF_SIZE, "guard", 5);
@@ -187,6 +201,7 @@ static void test_malformed_proof_lengths_are_rejected(void) {
             exit(1);
         }
         free(A);
+        free((void *)B);
         pairing_session_destroy(session);
         pairing_destroy(pairing);
     }
@@ -199,7 +214,7 @@ static void test_valid_srp_proof_returns_sha1_response(void) {
     pairing_t *pairing = pairing_init_generate(device_id, "", &result);
     pairing_session_t *session;
     const char *salt = NULL;
-    const char *B = NULL;
+    char *B = NULL;
     int salt_len = 0;
     int B_len = 0;
     unsigned char *A = NULL;
@@ -210,8 +225,7 @@ static void test_valid_srp_proof_returns_sha1_response(void) {
     assert(result == 0);
     session = pairing_session_init(pairing);
     assert(session != NULL);
-    assert(srp_new_user(session, pairing, device_id, pin, &salt, &salt_len,
-                        &B, &B_len) == 0);
+    new_test_user(session, pairing, device_id, pin, &salt, &salt_len, &B, &B_len);
 
     make_client_proof(device_id, pin, (const unsigned char *)salt, salt_len,
                       (const unsigned char *)B, B_len, &A, &len_A, proof_buffer);
@@ -228,6 +242,7 @@ static void test_valid_srp_proof_returns_sha1_response(void) {
     }
 
     free(A);
+    free((void *)B);
     pairing_session_destroy(session);
     pairing_destroy(pairing);
 }

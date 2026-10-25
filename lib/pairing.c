@@ -499,7 +499,10 @@ random_pin() {
 
 int
 srp_new_user(pairing_session_t *session, pairing_t *pairing, const char *device_id, const char *pin,
-             const char **salt, int *len_salt, const char **pk, int *len_pk) {
+             const char **salt, int *len_salt, char **pk, int *len_pk) {
+    *salt = NULL;
+    *pk = NULL;
+    *len_salt = *len_pk = 0;
     if (strlen(device_id) > SRP_USERNAME_SIZE) {
         return -1;
     }
@@ -531,6 +534,8 @@ srp_new_user(pairing_session_t *session, pairing_t *pairing, const char *device_
                                        (const unsigned char **) &srp_v, &len_v,
                                        NULL, NULL);
     if (len_s != SRP_SALT_SIZE || len_v != SRP_VERIFIER_SIZE) {
+        free(srp_s);
+        free(srp_v);
         return -3;
     }
 
@@ -546,6 +551,12 @@ srp_new_user(pairing_session_t *session, pairing_t *pairing, const char *device_
                                     (const unsigned char **) &srp_B, &len_B,
                                     NULL, NULL, 1);
 
+    free(srp_s);
+    free(srp_v);
+    if (!srp_B || len_B <= 0) {
+        free(srp_B);
+        return -4;
+    }
     *pk = (char *) srp_B;
     *len_pk = len_B;
 

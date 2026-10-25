@@ -830,6 +830,11 @@ raop_rtp_mirror_thread(void *arg)
             }
         }
     }
+    /* A stop or truncated packet can leave a payload and an unconsumed codec
+     * prefix. Keep the existing dynamic-buffer/callback contract. */
+    free(payload);
+    free(sps_pps);
+
     /* Close the stream file descriptor */
     if (stream_fd != -1) {
         CLOSESOCKET(stream_fd);

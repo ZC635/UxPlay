@@ -55,8 +55,9 @@ void pairing_destroy(pairing_t *pairing);
 
 int pairing_get_ecdh_secret_key(pairing_session_t *session, unsigned char ecdh_secret[X25519_KEY_SIZE]);
 
+/* salt is borrowed from session; caller must free the returned pk. */
 int srp_new_user(pairing_session_t *session, pairing_t *pairing, const char *device_id, const char *pin,
-		 const char **salt, int *len_salt, const char **pk, int *len_pk);
+		 const char **salt, int *len_salt, char **pk, int *len_pk);
 int srp_validate_proof(pairing_session_t *session, pairing_t *pairing, const unsigned char *A,
                        int len_A, unsigned char *proof, int proof_len);
 int srp_confirm_pair_setup(pairing_session_t *session, pairing_t *pairing, unsigned char *epk,

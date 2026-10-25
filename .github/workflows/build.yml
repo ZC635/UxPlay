@@ -50,6 +50,9 @@ jobs:
           test -x build/uxplay
           ls -la build/uxplay
 
+      - name: Protocol and memory regressions
+        run: ctest --test-dir build --output-on-failure -R 'Pairing|SetupLength|RtpCleanup|MirrorCleanup|RaopNtp|MirrorNal'
+
   build-windows-intel:
     runs-on: windows-latest
     strategy:
@@ -100,6 +103,9 @@ jobs:
           test -f build/uxplay.exe
           ls -la build/uxplay.exe
 
+      - name: Protocol and memory regressions
+        run: ctest --test-dir build --output-on-failure -R 'Pairing|SetupLength|RtpCleanup|MirrorCleanup|RaopNtp|MirrorNal'
+
 
   build-windows-arm64:
     runs-on: windows-11-arm
@@ -148,3 +154,5 @@ jobs:
           test -f build/uxplay.exe
           ls -la build/uxplay.exe
 
+      - name: Protocol regressions
+        run: ctest --test-dir build --output-on-failure -R 'Pairing|SetupLength|RtpCleanup|MirrorCleanup|RaopNtp|MirrorNal'
