@@ -78,6 +78,7 @@ jobs:
         with:
           msystem: ${{ matrix.msystem }}
           update: true
+          # Build/protocol checks need the base SDK, not gst-plugins-good runtime plugins.
           install: >-
             ${{ matrix.pkg_prefix }}-cmake
             ${{ matrix.pkg_prefix }}-gcc
@@ -85,7 +86,6 @@ jobs:
             ${{ matrix.pkg_prefix }}-libplist
             ${{ matrix.pkg_prefix }}-gstreamer
             ${{ matrix.pkg_prefix }}-gst-plugins-base
-            ${{ matrix.pkg_prefix }}-gst-plugins-good
             ${{ matrix.pkg_prefix }}-pkg-config
             base-devel
 
@@ -129,6 +129,7 @@ jobs:
         with:
           msystem: ${{ matrix.msystem }}
           update: true
+          # Build/protocol checks need the base SDK, not gst-plugins-good runtime plugins.
           install: >-
             ${{ matrix.pkg_prefix }}-cmake
             ${{ matrix.pkg_prefix }}-gcc
@@ -136,7 +137,6 @@ jobs:
             ${{ matrix.pkg_prefix }}-libplist
             ${{ matrix.pkg_prefix }}-gstreamer
             ${{ matrix.pkg_prefix }}-gst-plugins-base
-            ${{ matrix.pkg_prefix }}-gst-plugins-good
             ${{ matrix.pkg_prefix }}-pkg-config
             base-devel
 

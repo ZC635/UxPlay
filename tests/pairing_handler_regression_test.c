@@ -1,8 +1,8 @@
 /* Exercise real plist parsing and RTSP handlers; replace only the crypto
  * boundary so malformed sizes cannot hide behind authentication failure. */
+#include "../lib/pairing.h"
 #include <plist/plist.h>
 #include <string.h>
-#include "../lib/pairing.h"
 #include "../lib/fairplay.h"
 static int crypto_calls;
 static int accept_confirmation(pairing_session_t *s, pairing_t *p,
