@@ -56,7 +56,7 @@ jobs:
   build-windows-intel:
     runs-on: windows-latest
     strategy:
-        fail-fast: false
+      fail-fast: false
       matrix:
         msystem: [UCRT64, MINGW64]
         include:
