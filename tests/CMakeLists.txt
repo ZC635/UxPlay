@@ -19,6 +19,16 @@ else()
            COMMAND RendererSampleTapsTest)
 endif()
 
+add_executable(RtpCleanupTest rtp_cleanup_test.c)
+add_executable(MirrorCleanupTest mirror_cleanup_test.c)
+foreach(cleanup_target RtpCleanupTest MirrorCleanupTest)
+  target_link_libraries(${cleanup_target} PRIVATE airplay)
+  target_include_directories(${cleanup_target} PRIVATE ${PLIST_INCLUDE_DIRS})
+  add_test(NAME ${cleanup_target} COMMAND ${cleanup_target})
+  set_tests_properties(${cleanup_target} PROPERTIES TIMEOUT 15
+      ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${GSTREAMER_RUNTIME_BIN_DIR}")
+endforeach()
+
 set_tests_properties(RendererSampleTapsTest PROPERTIES TIMEOUT 20)
 
 find_package(PkgConfig REQUIRED)
@@ -52,3 +62,27 @@ endif()
 add_test(NAME MirrorNalRegressionTest COMMAND MirrorNalRegressionTest)
 set_tests_properties(MirrorNalRegressionTest PROPERTIES TIMEOUT 15
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${GSTREAMER_RUNTIME_BIN_DIR}")
+
+add_executable(PairingHandlerRegressionTest pairing_handler_regression_test.c)
+target_link_libraries(PairingHandlerRegressionTest PRIVATE airplay)
+target_include_directories(PairingHandlerRegressionTest PRIVATE ${PLIST_INCLUDE_DIRS})
+if(PLIST_21_FOUND)
+  target_compile_definitions(PairingHandlerRegressionTest PRIVATE PLIST_210)
+endif()
+if(PLIST_23_FOUND)
+  target_compile_definitions(PairingHandlerRegressionTest PRIVATE PLIST_230)
+endif()
+add_test(NAME PairingHandlerRegressionTest COMMAND PairingHandlerRegressionTest)
+add_test(NAME SetupLengthRegressionTest COMMAND PairingHandlerRegressionTest setup)
+set_tests_properties(PairingHandlerRegressionTest SetupLengthRegressionTest PROPERTIES TIMEOUT 20
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${GSTREAMER_RUNTIME_BIN_DIR}")
+
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND NOT APPLE)
+  add_executable(PairingMemoryTest pairing_memory_test.c)
+  target_link_libraries(PairingMemoryTest PRIVATE airplay)
+  target_link_options(PairingMemoryTest PRIVATE
+      "-Wl,--wrap=malloc" "-Wl,--wrap=calloc" "-Wl,--wrap=free")
+  add_test(NAME PairingMemoryTest COMMAND PairingMemoryTest)
+  set_tests_properties(PairingMemoryTest PROPERTIES TIMEOUT 30
+      ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${GSTREAMER_RUNTIME_BIN_DIR}")
+endif()
