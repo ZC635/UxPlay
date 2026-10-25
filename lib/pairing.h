@@ -18,6 +18,8 @@
 #ifndef PAIRING_H
 #define PAIRING_H
 
+#include <stdbool.h>
+
 #define PAIRING_SIG_SIZE (2 * X25519_KEY_SIZE)
 
 

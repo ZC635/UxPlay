@@ -64,6 +64,9 @@ set_tests_properties(MirrorNalRegressionTest PROPERTIES TIMEOUT 15
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${GSTREAMER_RUNTIME_BIN_DIR}")
 
 add_executable(PairingHandlerRegressionTest pairing_handler_regression_test.c)
+# Keep the header-first compile check effective even when GCC defaults to C23.
+set_target_properties(PairingHandlerRegressionTest PROPERTIES
+    C_STANDARD 99 C_STANDARD_REQUIRED YES)
 target_link_libraries(PairingHandlerRegressionTest PRIVATE airplay)
 target_include_directories(PairingHandlerRegressionTest PRIVATE ${PLIST_INCLUDE_DIRS})
 if(PLIST_21_FOUND)
