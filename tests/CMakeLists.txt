@@ -65,9 +65,6 @@ set_tests_properties(MirrorNalRegressionTest PROPERTIES TIMEOUT 15
 
 add_executable(PairingHandlerRegressionTest pairing_handler_regression_test.c)
 target_link_libraries(PairingHandlerRegressionTest PRIVATE airplay)
-if(UNIX AND NOT APPLE)
-  target_link_libraries(PairingHandlerRegressionTest PRIVATE m)
-endif()
 target_include_directories(PairingHandlerRegressionTest PRIVATE ${PLIST_INCLUDE_DIRS})
 if(PLIST_21_FOUND)
   target_compile_definitions(PairingHandlerRegressionTest PRIVATE PLIST_210)
